@@ -604,17 +604,90 @@ class DramaTool:
                 bad.append(no)
         return bad
 
-    def merge(self, out_dir, eps, full_path):
+    def _v_info(self, f):
+        """读视频轨 (首帧pts秒, 时基tbn)。"""
+        pts, tbn = 0.0, None
+        try:
+            import re
+            r = subprocess.run(
+                [FFMPEG, "-hide_banner", "-i", f, "-vf", "showinfo",
+                 "-an", "-frames:v", "1", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=60)
+            m = re.search(r"(\d+) tbn", r.stderr)
+            if m:
+                tbn = int(m.group(1))
+            for line in r.stderr.splitlines():
+                if "pts_time:" in line:
+                    pts = float(line.split("pts_time:")[1].split(" ")[0])
+                    break
+        except Exception:
+            pass
+        return pts, tbn
+
+    def _container_dur(self, f):
+        try:
+            r = subprocess.run([FFMPEG, "-hide_banner", "-i", f],
+                               capture_output=True, text=True, timeout=60)
+            import re
+            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr)
+            if m:
+                return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        except Exception:
+            pass
+        return None
+
+    def _normalize_vstart(self, src, offset):
+        """流拷贝归一化视频轨：①首帧 pts 前移 offset 归零；②时基统一为
+        15360 tick/s——片源存在 30fps(15360) 与 24fps(12288) 混装，时基不
+        一致会让 concat -c copy 错算时间轴（24fps 内容被压进 1/30 刻度，
+        每集提速 25% 并产生大空洞），这是合成卡顿的核心根因；③截除片尾
+        音频静音填充。全程零转码。失败回退原文件。"""
+        dst = src[:-4] + "._ns.mp4"
+        dur = self._container_dur(src)
+        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+               "-itsoffset", str(-offset), "-i", src, "-i", src,
+               "-map", "0:v", "-map", "1:a", "-c", "copy",
+               "-video_track_timescale", "15360"]
+        if dur:
+            cmd += ["-t", str(round(dur - offset - 0.02, 3))]
+        cmd += ["-movflags", "+faststart", dst]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           env=ENV_NO_PROXY, timeout=300)
+        if r.returncode != 0 or not os.path.exists(dst):
+            return src          # 修复失败时回退原文件（不影响合成）
+        return dst
+
+    def merge(self, out_dir, eps, full_path, progress_fn=None):
+        """无损合成。逐集归一化后 concat：①视频首帧 pts 归零（片源 +0.16s
+        头部偏移会造成接缝冻结）②视频时基统一 15360（30/24fps 混装时基不
+        一致会造成跳帧与大空洞）③截除片尾音频静音填充。"""
+        use, tmps = {}, []
+        eps_sorted = sorted(eps)
+        for i, no in enumerate(eps_sorted):
+            p = os.path.join(out_dir, f"ep{no:02d}.mp4")
+            off, tbn = self._v_info(p)
+            if off > 0.02 or (tbn and tbn != 15360):
+                use[no] = self._normalize_vstart(p, off)
+                if use[no] != p:
+                    tmps.append(use[no])
+            else:
+                use[no] = p
+            if progress_fn:
+                progress_fn(i + 1, len(eps_sorted))
         lst = os.path.join(out_dir, "concat.txt")
         with open(lst, "w", encoding="utf-8") as fh:
-            for no in sorted(eps):
-                p = os.path.join(out_dir, f"ep{no:02d}.mp4").replace("\\", "/")
-                fh.write(f"file '{p}'\n")
+            for no in eps_sorted:
+                fh.write(f"file '{use[no].replace(os.sep, '/')}'\n")
         cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
                "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
                "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", full_path]
         r = subprocess.run(cmd, capture_output=True, text=True, env=ENV_NO_PROXY,
                            timeout=3600)
+        for t in tmps:
+            try:
+                os.remove(t)
+            except OSError:
+                pass
         if os.path.exists(lst):
             os.remove(lst)
         if r.returncode != 0:
