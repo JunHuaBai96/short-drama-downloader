@@ -47,6 +47,19 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(APP_DIR, "beidou_pool_cache.json")
+
+
+def pick_folder_dialog():
+    """弹出 Windows 文件夹选择对话框（PowerShell FolderBrowserDialog）"""
+    script = ("Add-Type -AssemblyName System.Windows.Forms; "
+              "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+              "$f.Description = '选择文件夹'; "
+              "if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } "
+              "else { '' }")
+    r = subprocess.run(["powershell", "-STA", "-NoProfile", "-Command", script],
+                       capture_output=True, text=True, timeout=180)
+    p = (r.stdout or "").strip()
+    return p if p and os.path.isdir(p) else None
 LOG_DIR = os.path.join(APP_DIR, "logs")
 PORT = 8765
 
@@ -238,6 +251,53 @@ class DramaTool:
         cands.sort(key=lambda x: -x["ratio"])
         return cands[:15]
 
+    def search_global(self, keyword, pages_per_app=2):
+        """实时全局检索：绕过本地缓存，实时拉取北斗各平台全量窗口。
+
+        背景（实测）：YourChannel 官网搜索接口已停用（任何参数均返回
+        "短剧未找到"，包括在库剧名与 playlet_id），北斗智影任务池是唯一
+        可检索数据源；每平台仅暴露 200 条（收入排序，平台硬限制）。
+        检索后自动更新本地缓存兜底。
+        """
+        s = new_session()
+        s.headers.update({"Referer": "https://inbeidou.cn/"})
+        pool = {}
+        for app in BEIDOU_APPS:
+            items = []
+            for page in range(1, pages_per_app + 1):
+                p = {"page_num": page, "page_size": 100, "app_id": app,
+                     "order_field": "total_income", "order_dir": "desc"}
+                try:
+                    r = s.get(BEIDOU_POOL, params=p, timeout=30)
+                    d = ((r.json() or {}).get("body") or {}).get("data") or []
+                except Exception as e:
+                    self.log(f"[实时检索] {app} 第 {page} 页失败: {e}")
+                    break
+                items += d
+                if len(d) < 100:
+                    break
+            pool[app] = items
+        total = sum(len(v) for v in pool.values())
+        if total == 0:
+            raise RuntimeError("北斗任务池实时拉取失败（0 条）")
+        self.log(f"[实时检索] 已拉取 {len(pool)} 平台共 {total} 条（未用本地缓存）")
+        self.cache = pool
+        self.save_cache()
+        kw = (keyword or "").lower().replace("’", "'").strip()
+        cands = []
+        for app, items in pool.items():
+            for t in items:
+                title = str(t.get("title") or "")
+                ratio = difflib.SequenceMatcher(
+                    None, kw, title.lower().replace("’", "'").strip()).ratio()
+                if ratio > 0.4 or kw in title.lower():
+                    cands.append({"ratio": round(ratio, 3), "app": app,
+                                  "title": title, "task_id": t.get("task_id"),
+                                  "playlet_id": str(t.get("third_serial_id")),
+                                  "episode_count": t.get("episode_count")})
+        cands.sort(key=lambda x: -x["ratio"])
+        return cands[:15]
+
     def download_eps(self, eps, out_dir, progress_fn=None, workers=4):
         os.makedirs(out_dir, exist_ok=True)
         fails = []
@@ -377,6 +437,7 @@ def job_search(payload):
             drama = TOOL.resolve_task(task[0], task[1])
             STATE.current = drama
             STATE.download_dir = None
+            STATE.result = None
             TOOL.log(f"[结果] 《{drama['title']}》 官方 {drama['official_eps']} 集，"
                      f"API 返回 {len(drama['eps'])} 集")
             set_status(f"已就绪：《{drama['title']}》({len(drama['eps'])} 集) —— 可开始下载",
@@ -388,19 +449,25 @@ def job_search(payload):
             drama = TOOL.fetch_playlet(pid)
             STATE.current = drama
             STATE.download_dir = None
+            STATE.result = None
             TOOL.log(f"[结果] 《{drama['title']}》 官方 {drama['official_eps']} 集，"
                      f"API 返回 {len(drama['eps'])} 集")
             set_status(f"已就绪：《{drama['title']}》({len(drama['eps'])} 集) —— 可开始下载",
                        busy=False)
         elif kw:
-            TOOL.log(f"[搜索] 按剧名模糊匹配: {kw}")
-            cands = TOOL.search_by_name(kw)
+            TOOL.log(f"[搜索] 按剧名实时全局检索: {kw}")
+            try:
+                cands = TOOL.search_global(kw)
+            except Exception as e:
+                TOOL.log(f"[实时检索] 失败（{e}），回落本地缓存匹配")
+                cands = TOOL.search_by_name(kw)
             if not cands:
                 TOOL.log("[结果] 未找到匹配剧目。")
-                TOOL.log("  原因说明：YourChannel 官网不提供按剧名搜索的接口（已实测），")
-                TOOL.log("  剧名匹配依赖北斗任务池缓存（7 平台 × 各 Top200，按收入排序）。")
-                TOOL.log("  新上架或低热度剧可能不在池中。请到北斗任务详情页或")
-                TOOL.log("  yourchannel.ai 播放页复制链接，直接粘贴到输入框重试。")
+                TOOL.log("  原因说明：YourChannel 官网搜索接口已停用（实测），")
+                TOOL.log("  剧名实时检索走北斗任务池（7 平台 × 各 200 条，收入排序，")
+                TOOL.log("  平台仅暴露 200 条为硬限制）。新上架或低热度剧可能不在池中。")
+                TOOL.log("  请到北斗任务详情页或 yourchannel.ai 播放页复制链接，")
+                TOOL.log("  直接粘贴到输入框重试（任务链接/播放页链接均可直连）。")
                 set_status("搜索无结果（详见日志说明）", busy=False)
             else:
                 STATE.result = {"type": "candidates", "candidates": cands}
@@ -439,6 +506,7 @@ def job_fetch(pid):
         drama = TOOL.fetch_playlet(pid)
         STATE.current = drama
         STATE.download_dir = None
+        STATE.result = None
         TOOL.log(f"[结果] 《{drama['title']}》 官方 {drama['official_eps']} 集，"
                  f"API 返回 {len(drama['eps'])} 集")
         set_status(f"已就绪：《{drama['title']}》 —— 可开始下载", busy=False)
@@ -496,7 +564,7 @@ def job_merge():
         set_status("请先完成下载", busy=False)
         return
     set_status("合成中（无损拼接，不重编码）…", busy=True)
-    full = out.rstrip("\\/") + "-FULL.mp4"
+    full = os.path.join(out, "FULL.mp4")
     try:
         size = TOOL.merge(out, drama["eps"], full)
         TOOL.log(f"[合成] 成片: {full} ({size//1048576}MB)")
@@ -544,25 +612,27 @@ th{background:#1b2130;color:#9fb6d9}
 <div class="row">
   <input id="q" type="text" placeholder="剧名 / 播放页URL / playlet_id / 北斗任务链接（均可直连）">
   <button onclick="doSearch()">搜索</button>
-  <button class="gray" onclick="doRefresh()">刷新北斗任务池</button>
+  <button class="gray" onclick="doClearResult()">清除结果</button>
 </div>
 <div class="row">
-  <input id="out" type="text" style="flex:2" placeholder="输出目录">
-  <button class="gray" onclick="pickDir()">浏览…</button>
+  <input id="out" type="text" style="flex:2" placeholder="输出目录（分集下载与合成成片 FULL.mp4 均保存在此）">
+  <button class="gray" onclick="pickDir('out')">浏览…</button>
 </div>
 <div class="row">
   <button class="green" id="bdl" onclick="doDownload()">开始下载</button>
   <button class="green" id="bmg" onclick="doMerge()">合成为完整视频</button>
   <button class="gray" id="bex" onclick="doExport()">导出日志</button>
   <input id="expath" type="text" style="flex:1" placeholder="日志导出路径（留空=桌面）">
+  <button class="gray" onclick="pickDir('expath')">浏览…</button>
   <button class="gray" onclick="openDir()">打开输出目录</button>
   <button class="gray" onclick="doClearPool()">清除任务池</button>
+  <button class="gray" onclick="doClearLog()">清空日志</button>
 </div>
 <div id="bar"><div id="barin"></div></div>
 <div class="st" id="st">初始化…</div>
 <table id="cands" style="display:none"><thead><tr><th>匹配度</th><th>平台</th><th>剧名</th><th>集数</th><th>playlet_id</th><th></th></tr></thead><tbody></tbody></table>
 <div id="log"></div>
-<p style="color:#66708a;font-size:12px">提示：YourChannel 官网无按名搜索接口，剧名搜索走北斗任务池（各平台 Top200）；
+<p style="color:#66708a;font-size:12px">提示：YourChannel 官网搜索接口已停用（实测），剧名搜索为实时全局检索北斗任务池（7 平台 × 各 200 条，收入排序，平台仅暴露 200 条为硬限制）；
 新剧请直接粘贴播放页链接（yourchannel.ai/pagesSub/player?id=…）或北斗任务链接（inbeidou.cn/task-detail?task_id=…）。YC 剧集字幕为画面烧录式，随视频获取。</p>
 <script>
 let timer=null;
@@ -571,6 +641,9 @@ async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'C
 async function doSearch(){const t=document.getElementById('q').value;if(!t)return alert('请输入剧名、URL 或 id');await post('/api/search',{text:t})}
 async function doRefresh(){await post('/api/refresh',{})}
 async function doClearPool(){if(!confirm('确定清除本地任务池缓存？下次搜索将自动重新拉取。'))return;await post('/api/clear_pool',{})}
+async function doClearResult(){await post('/api/clear_result',{})}
+async function doClearLog(){await post('/api/clear_log',{})}
+async function pickDir(target){const d=await post('/api/pick_dir',{});if(d.path)document.getElementById(target).value=d.path}
 async function doDownload(){await post('/api/download',{out:document.getElementById('out').value})}
 async function doMerge(){await post('/api/merge',{})}
 async function doExport(){const d=await post('/api/export_log',{path:document.getElementById('expath').value});if(d.path)alert('日志已导出:\\n'+d.path)}
@@ -641,7 +714,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
             except Exception:
                 payload = {}
-        if STATE.busy and self.path not in ("/api/open_dir",):
+        if STATE.busy and self.path not in ("/api/open_dir", "/api/pick_dir"):
             self._json({"ok": False, "msg": "busy"})
             return
         if self.path == "/api/search":
@@ -679,6 +752,20 @@ class Handler(BaseHTTPRequestHandler):
                     set_status(f"清除失败: {e}", busy=False)
             threading.Thread(target=work, daemon=True).start()
             self._json({"ok": True})
+        elif self.path == "/api/clear_result":
+            STATE.result = None
+            TOOL.log("[界面] 已清除候选列表")
+            self._json({"ok": True})
+        elif self.path == "/api/clear_log":
+            STATE.logs = []
+            STATE.push_log("[界面] 日志已清空")
+            self._json({"ok": True})
+        elif self.path == "/api/pick_dir":
+            try:
+                p = pick_folder_dialog()
+                self._json({"ok": True, "path": p or ""})
+            except Exception as e:
+                self._json({"ok": False, "msg": str(e), "path": ""})
         elif self.path == "/api/export_log":
             p = (payload.get("path") or "").strip()
             if not p:
