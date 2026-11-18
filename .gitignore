@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+dist/
+build/
+logs/
+beidou_pool_cache.json
+_test_out/
+*.log
