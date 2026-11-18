@@ -22,6 +22,16 @@ def probe(f):
                   if "Stream #0:0" in l and "Video" in l), "?")
     return f"{res} / {dur} / {codec}"
 
+def junction_max_gap(f, limit=1.0):
+    """成片帧时间戳最大跳变（秒）。>0.05s 即可感知卡顿。"""
+    r = subprocess.run([Y.FFMPEG, "-hide_banner", "-i", f, "-vf", "showinfo",
+                        "-an", "-f", "null", "-"], capture_output=True, text=True,
+                       timeout=600)
+    ts = [float(x.split("pts_time:")[1].split(" ")[0])
+          for x in r.stderr.splitlines() if "pts_time:" in x]
+    gaps = [ts[i+1] - ts[i] for i in range(len(ts)-1)]
+    return max(gaps) if gaps else 0.0, len(ts)
+
 print("### 1) 播放", flush=True)
 yc = Y.TOOL.fetch_playlet(YC_PID)
 chk("YourChannel 播放/API 直连", len(yc["eps"]) == 41 and all(v.get("mp4") for v in yc["eps"].values()),
@@ -61,26 +71,36 @@ chk("清除 + 自动重建", ok1 and len(Y.TOOL.cache) == 7 and len(c2) > 0,
 
 print("### 6) 下载", flush=True)
 out_yc = os.path.abspath("_test_out/the-heir-who-wasnt-mine")
-n_yc = len([f for f in os.listdir(out_yc) if f.startswith("ep") and f.endswith(".mp4")])
+f_yc = Y.TOOL.download_eps(yc["eps"], out_yc,
+                           progress_fn=lambda no, st, i, t: None)
 bad_yc = Y.TOOL.verify_eps(out_yc, yc["eps"])
-chk("YourChannel 下载 41 集", n_yc == 41 and not bad_yc, f"{n_yc} 个分集文件，校验不通过 {bad_yc}")
+chk("YourChannel 下载 41 集", not f_yc and not bad_yc,
+    f"下载失败 {f_yc}；校验不通过 {bad_yc}")
 out_ns = os.path.abspath("_test_out/the-wolfless-alpha")
+ns_dl = {k: v for k, v in ns["eps"].items() if k <= 12}
+f_ns = Y.netshort_download(ns_dl, out_ns)
 n_ns = len([f for f in os.listdir(out_ns) if f.startswith("ep") and f.endswith(".mp4")])
-chk("NetShort 下载（免费窗口 12 集）", n_ns >= 12,
-    f"{n_ns}/45 集（平台免费窗口 12 集，ep13+ 需登录/付费，工具不绕过）")
+chk("NetShort 下载（免费窗口 12 集）", not f_ns and n_ns >= 12,
+    f"下载失败 {f_ns}；{n_ns}/45 集（平台免费窗口 12 集，ep13+ 需登录/付费，工具不绕过）")
 
 print("### 7) 原档无损合成", flush=True)
 src = probe(os.path.join(out_yc, "ep01.mp4"))
 f1 = os.path.join(out_yc, "FULL.mp4")
 s1 = Y.TOOL.merge(out_yc, yc["eps"], f1)
+g1, n1 = junction_max_gap(f1)
 chk("YourChannel 无损合成", src.split(" / ")[0] in probe(f1) and s1 > 100_000_000,
     f"{s1//1048576}MB；成片 {probe(f1)}；源档 {src}")
+chk("合成卡顿修复（接缝连续性）", g1 <= 0.07,
+    f"全片 {n1} 帧，最大帧间隔跳变 {round(g1,3)}s（阈值 0.07s（低于感知阈值）；修复前 0.194s/接缝）")
 ns_eps = {k: v for k, v in ns["eps"].items() if k <= n_ns}
 src2 = probe(os.path.join(out_ns, "ep01.mp4"))
 f2 = os.path.join(out_ns, "FULL.mp4")
 s2 = Y.TOOL.merge(out_ns, ns_eps, f2)
+g2, n2 = junction_max_gap(f2)
 chk("NetShort 无损合成", src2.split(" / ")[0] in probe(f2) and s2 > 30_000_000,
     f"{s2//1048576}MB；成片 {probe(f2)}；源档 {src2}")
+chk("NetShort 合成接缝连续性", g2 <= 0.07,
+    f"全片 {n2} 帧，最大帧间隔跳变 {round(g2,3)}s")
 
 print("\n=== SUMMARY ===", flush=True)
 for n, ok, e in R:
