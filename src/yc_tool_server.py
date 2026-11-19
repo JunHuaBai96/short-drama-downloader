@@ -42,7 +42,7 @@ API_BASE = "https://api.yourwebnovel.com/yourchannel/app"
 PLAYLET_V3 = API_BASE + "/playlet/v3/{}?pageNo={}&pageSize=100"
 BEIDOU_POOL = "https://api-scenter.inbeidou.cn/agent/v1/task/page"
 BEIDOU_APPS = ["yourchannel_drama", "kalostv", "netshort", "stardusttv",
-               "touchshort", "dramabox", "reelshort"]
+               "touchshort", "dramabox", "reelshort", "dramawave"]
 
 # 多平台剧场识别（来源：短剧上新监控面板 11 平台清单）
 PLATFORMS = {
@@ -329,15 +329,22 @@ def narto_resolve(url):
 
 
 def narto_play_url(slug, no, sess=None):
-    """经边缘域 refresh-source 端点实时取分集 MP4 直链（免登录）"""
+    """经边缘域 refresh-source 端点实时取分集 MP4 直链（免登录，含 3 次重试）"""
     sess = sess or narto_session()
     u = (f"{NARTO_EDGE}/e/rs/detail/watch/{slug}/{no}/refresh-source"
          f"?lang={NARTO_LANG}")
-    r = sess.get(u, headers={"Accept": "application/json"}, timeout=40)
-    d = r.json()
-    if not d.get("ok") or not d.get("play_url"):
-        raise RuntimeError(d.get("message") or "refresh-source 未返回播放地址")
-    return d["play_url"]
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = sess.get(u, headers={"Accept": "application/json"}, timeout=40)
+            d = r.json()
+            if d.get("ok") and d.get("play_url"):
+                return d["play_url"]
+            last_err = RuntimeError(d.get("message") or "未返回播放地址")
+        except Exception as e:
+            last_err = e
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"refresh-source 第 {no} 集失败: {last_err}")
 
 
 def narto_download(eps, out_dir, log=None, progress=None):
@@ -369,6 +376,45 @@ def narto_download(eps, out_dir, log=None, progress=None):
     dl_eps = {no: {"mp4": u} for no, u in urls.items() if u}
     fails2 = DramaTool().download_eps(dl_eps, out_dir, progress, workers=4)
     return sorted(set(fails) | set(fails2))
+
+
+def narto_search_titles(keyword, limit=24):
+    """免登录站内搜索：GET /search?q=<kw>&lang=zh-TW（SSR 渲染，JSON-LD 清单）。
+    返回 [(watch_url, title), ...]。注意：sections API 的 q 参数与
+    /search/providers/retry 均需登录（实测 login_required:true），此通道不需。"""
+    sess = narto_session()
+    r = sess.get(NARTO_MAIN + "/search",
+                 params={"q": keyword, "lang": NARTO_LANG}, timeout=40)
+    items = re.findall(r'"@type":"ListItem","position":\d+,'
+                       r'"url":"([^"]+)","name":"([^"]+)"', r.text)
+    seen, out = set(), []
+    for u, title in items:
+        slug = u.split("/detail/watch/")[1].split("?")[0]
+        if slug not in seen:
+            seen.add(slug)
+            out.append((f"{NARTO_MAIN}/detail/watch/{slug}?lang={NARTO_LANG}",
+                        title))
+    return out[:limit]
+
+
+def narto_locate_by_title(title, log=None):
+    """按剧名在 Narto Drama 定位片源并解析播放页（供非 YC 源任务复用）"""
+    hits = narto_search_titles(title)
+    if not hits:
+        raise RuntimeError("站内搜索无结果")
+    kw = (title or "").lower().replace("’", "'").strip()
+    best, best_ratio = None, 0.0
+    for u, t in hits:
+        ratio = difflib.SequenceMatcher(
+            None, kw, t.lower().replace("’", "'").strip()).ratio()
+        if ratio > best_ratio:
+            best, best_ratio = (u, t), ratio
+    if best_ratio < 0.55:
+        raise RuntimeError(f"最接近的《{best[1]}》匹配度仅 {best_ratio:.2f}，"
+                           f"未达自动定位阈值")
+    if log:
+        log(f"[Narto] 片源定位命中：《{best[1]}》（匹配度 {best_ratio:.3f}）")
+    return narto_resolve(best[0])
 
 
 def panel_index():
@@ -498,16 +544,27 @@ class DramaTool:
         return data[0]
 
     def resolve_task(self, task_id, app_id=None):
-        """按 task_id 从北斗任务池定位任务，返回 YC 剧目信息"""
+        """按 task_id 从北斗任务池定位任务：
+        YC 源 → 直连 YC v3 API；非 YC 源 → Narto Drama 片源按剧名定位"""
         t = self.fetch_task(task_id, app_id)
         pid = str(t.get("third_serial_id") or "")
-        self.log(f"[任务链接] task_id={task_id} → 《{t.get('title')}》 "
+        title = str(t.get("title") or "")
+        self.log(f"[任务链接] task_id={task_id} → 《{title}》 "
                  f"{t.get('episode_count')}集 playlet_id={pid or '缺失'}")
-        if not pid:
-            raise RuntimeError(f"任务 {task_id} 无 third_serial_id，"
-                               f"该任务可能不是 YC 源（app_id={app_id}）")
         if app_id and app_id != "yourchannel_drama":
-            self.log(f"[提示] 该任务来自 {app_id}，非 YC 源，暂只能获取任务信息")
+            self.log(f"[提示] 该任务来自 {app_id}（非 YC 源），"
+                     f"尝试 Narto Drama 多剧场片源定位…")
+            try:
+                drama = narto_locate_by_title(title, self.log)
+            except Exception as e:
+                raise RuntimeError(
+                    f"任务 {task_id} 来自 {app_id}（非 YC 源），任务信息："
+                    f"《{title}》{t.get('episode_count')} 集；未能从 Narto "
+                    f"Drama 片源定位（{e}）。可到 narto-drama.com 搜索该剧，"
+                    f"复制播放页链接后粘贴重试。")
+            drama["task_id"] = t.get("task_id")
+            drama["source_app"] = app_id
+            return drama
         drama = self.fetch_playlet(pid)
         drama["task_id"] = t.get("task_id")
         return drama
@@ -669,51 +726,22 @@ class DramaTool:
         return hits[:limit]
 
     def search_narto(self, keyword, limit=8):
-        """实时检索 Narto Drama 多剧场片源（免登录）：
-        走 SSR 首页（tab-provider + page，JSON-LD 清单，每页 24 条、零重叠），
-        目标片源拉全部页、其余剧场拉第 1 页，本地标题过滤。
+        """实时检索 Narto Drama 片源（免登录 /search?q= 通道）。
         返回候选（含 watch_url，可直接定位播放页）。"""
-        sess = narto_session()
-        providers = narto_provider_keys(sess)
+        hits = narto_search_titles(keyword, limit=24)
+        if not hits:
+            raise RuntimeError("Narto 站内搜索无结果")
         kw = (keyword or "").lower().replace("’", "'").strip()
-
-        def fetch_pg(pv_pg):
-            pv, pg = pv_pg
-            try:
-                r = sess.get(NARTO_MAIN, params={
-                    "lang": NARTO_LANG, "tab-provider": pv, "page": pg},
-                    timeout=40)
-                return pv, re.findall(
-                    r'"@type":"ListItem","position":\d+,'
-                    r'"url":"([^"]+)","name":"([^"]+)"', r.text)
-            except Exception:
-                return pv, []
-
-        import concurrent.futures as cf
-        plans = [(p, 1) for p in providers] + [("bibishort", n) for n in (2, 3, 4)]
-        cands, seen = [], set()
-        with cf.ThreadPoolExecutor(8) as ex:
-            for pv, lst in ex.map(fetch_pg, plans):
-                for u, title in lst:
-                    slug = u.split("/detail/watch/")[1].split("?")[0]
-                    if slug in seen:
-                        continue
-                    seen.add(slug)
-                    ratio = difflib.SequenceMatcher(
-                        None, kw, title.lower()).ratio()
-                    if kw in title.lower() or ratio > 0.45:
-                        cands.append({
-                            "ratio": round(ratio, 3), "app": f"narto·{pv}",
-                            "title": title.split(") ", 1)[-1] if ") " in title
-                            else title,
-                            "watch_url": f"{NARTO_MAIN}/detail/watch/{slug}"
-                                         f"?lang={NARTO_LANG}",
-                            "book_id": slug, "episode_count": "",
-                            "playlet_id": slug})
-        if not seen:
-            raise RuntimeError("Narto 片源列表拉取失败（0 条）")
-        self.log(f"[Narto] 实时拉取 {len(providers)} 剧场 {len(seen)} 部，"
-                 f"标题命中 {len(cands)} 条")
+        cands = []
+        for u, title in hits:
+            ratio = difflib.SequenceMatcher(
+                None, kw, title.lower().replace("’", "'").strip()).ratio()
+            slug = u.split("/detail/watch/")[1].split("?")[0]
+            cands.append({"ratio": round(ratio, 3), "app": "narto",
+                          "title": title,
+                          "watch_url": u, "book_id": slug,
+                          "episode_count": "", "playlet_id": slug})
+        self.log(f"[Narto] 站内搜索命中 {len(cands)} 条")
         cands.sort(key=lambda x: -x["ratio"])
         return cands[:limit]
 
@@ -927,12 +955,15 @@ def job_search(payload):
         if task:
             TOOL.log(f"[搜索] 识别为北斗任务链接: task_id={task[0]} app_id={task[1]}")
             if task[1] == "netshort":
-                info = TOOL.fetch_task(task[0], task[1])
-                TOOL.log(f"[任务链接] 定位到 NetShort 剧集：{info.get('title')}，"
-                         f"请在 NetShort 官网播放页打开后粘贴播放页链接下载")
-                set_status(f"NetShort 任务：{info.get('title')}（需播放页链接）",
-                           busy=False)
-                return
+                try:
+                    drama = TOOL.resolve_task(task[0], task[1])
+                except Exception:
+                    info = TOOL.fetch_task(task[0], task[1])
+                    TOOL.log(f"[提示] Narto 片源未收录《{info.get('title')}》；"
+                             f"NetShort 直下需官网播放页链接（粘贴后用 Edge 解析）")
+                    set_status(f"NetShort 任务：{info.get('title')}"
+                               f"（Narto 未收录，需播放页链接）", busy=False)
+                    return
             drama = TOOL.resolve_task(task[0], task[1])
             STATE.current = drama
             STATE.download_dir = None
@@ -967,7 +998,8 @@ def job_search(payload):
             return
         if pkey and pkey != "yc":
             TOOL.log(f"[平台] 识别为 {pname}（{pkey}），本版下载适配支持 "
-                     f"YourChannel / NetShort 两个平台；该平台暂仅做识别")
+                     f"YourChannel / NetShort / Narto Drama 三个平台；"
+                     f"该平台暂仅做识别")
             set_status(f"已识别为 {pname}（暂不支持下载）", busy=False)
             return
         pid, kw = DramaTool.parse_input(text)
@@ -1005,9 +1037,10 @@ def job_search(payload):
             if not cands:
                 TOOL.log("[结果] 未找到匹配剧目。")
                 TOOL.log("  原因说明：YourChannel 官网搜索接口已停用（实测），")
-                TOOL.log("  剧名实时检索走北斗任务池（7 平台 × 各 200 条，收入排序，")
-                TOOL.log("  平台仅暴露 200 条为硬限制）。新上架或低热度剧可能不在池中。")
-                TOOL.log("  请到北斗任务详情页或 yourchannel.ai 播放页复制链接，")
+                TOOL.log("  剧名实时检索走北斗任务池（8 平台 × 各 200 条，收入排序，")
+                TOOL.log("  平台仅暴露 200 条为硬限制）+ Narto Drama 站内搜索。")
+                TOOL.log("  新上架或低热度剧可能不在北斗池窗口中。请到北斗任务详情页、")
+                TOOL.log("  narto-drama.com 或 yourchannel.ai 复制链接，")
                 TOOL.log("  直接粘贴到输入框重试（任务链接/播放页链接均可直连）。")
                 set_status("搜索无结果（详见日志说明）", busy=False)
             else:
@@ -1200,7 +1233,7 @@ th{background:#1b2130;color:#9fb6d9}
 <table id="cands" style="display:none"><thead><tr><th>匹配度</th><th>平台</th><th>剧名</th><th>集数</th><th>playlet_id</th><th></th></tr></thead><tbody></tbody></table>
 <div id="log"></div>
 <p style="color:#66708a;font-size:12px">支持平台：<b>YourChannel</b>（API 直连）、<b>NetShort</b>（播放页链接，签名直链由本机 Edge 解析）、<b>Narto Drama 多剧场</b>（播放页链接直连，含 BibiShort 等 35+ 片源，直链下载）；其余剧场（ShortMax / DramaBox / ReelShort / StardustTV / KalosTV / GoodShort / FlickReels / MoboReels / StoryReel）可识别并跨平台检索，下载适配持续推进。<br>
-提示：剧名搜索为实时检索——北斗任务池（7 平台 × 各 200 条）+ 11 平台上新面板索引 + Narto Drama 多剧场片源（免登录，候选可一键「用此剧」）；新剧也可直接粘贴播放页链接或北斗任务链接。</p>
+提示：剧名搜索为实时检索——北斗任务池（8 平台 × 各 200 条）+ 11 平台上新面板索引 + Narto Drama 站内搜索（免登录，候选可一键「用此剧」）；北斗非 YC 源任务（dramawave / dramabox 等）链接可自动定位到 Narto 对应片源；新剧也可直接粘贴播放页链接或北斗任务链接。</p>
 <script>
 let timer=null;
 function fmt(){return (new Date).toLocaleTimeString('zh-CN',{hour12:false})}
