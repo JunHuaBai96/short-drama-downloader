@@ -30,6 +30,7 @@
    - NetShort：粘贴播放页链接（`web.netshort.com/episode/<slug>-<id>`），工具自动枚举全部分集
    - Narto Drama：粘贴播放页链接（`narto-drama.com/detail/watch/<slug>`，含 BibiShort 等片源的 `/search/import` 导入链接），工具自动枚举全部分集并直链下载
    - **北斗非 YC 源任务自动定位**：粘贴 dramawave / dramabox 等非 YC 平台的任务详情链接，工具自动按剧名在 Narto Drama 定位对应片源并就绪下载（例：dramawave task 1062568559 → 《Love Games with My Dragon Boss》51 集）
+   - **直链 CDN 拦截自动降级**：Narto 部分片源（bibishort 等，托管于 hakunaymatata/CloudFront）直链被 CDN Function 拦截（实测 428 Precondition Required），工具自动探测并降级为站方边缘代理流（`force=1&force_edge=1&no_cache=1`，与站点播放器自身降级逻辑一致）
    - 剧名搜索为实时检索北斗任务池 + 面板索引（新上架剧可能不在池中，此时用链接直连）
 2. **开始下载**：输出目录支持「浏览」选择，分集与合成成片均保存在此目录，进度实时显示
 3. **合成**：下载校验通过后点「合成为完整视频」，成片 `FULL.mp4` 与分集在同一目录
