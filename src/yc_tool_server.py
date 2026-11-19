@@ -57,8 +57,10 @@ PLATFORMS = {
     "flickreels.net": ("flickreels", "FlickReels"),
     "moboreels.com": ("moboreels", "MoboReels"),
     "storyreel.life": ("storyreel", "StoryReel"),
+    "narto-drama.com": ("narto", "Narto Drama"),
+    "nartodrama.com": ("narto", "Narto Drama"),
 }
-DOWNLOAD_SUPPORTED = {"yc", "netshort"}
+DOWNLOAD_SUPPORTED = {"yc", "netshort", "narto"}
 PANEL_URL = "https://e6efc0c913ac4c26b646abfbb6e6b0e6.app.codebuddy.work/"
 
 
@@ -242,6 +244,131 @@ def netshort_download(eps, out_dir, log=None, progress=None):
     finally:
         session.close()
     return fails
+
+
+# ---------------------------------------------------------------------------
+# Narto Drama（多剧场聚合站，含 BibiShort 等 35+ 片源）——直链通道，无需浏览器
+# ---------------------------------------------------------------------------
+NARTO_MAIN = "https://narto-drama.com"
+NARTO_EDGE = "https://nartodrama.com"          # refresh-source 走此边缘域
+NARTO_UA = NS_UA
+NARTO_LANG = "zh-TW"
+
+
+def _nd_ck():
+    """复刻站点 JS 浏览器检查 Cookie：Date.now().toString(36)+随机 10 位"""
+    import random
+    import string
+    return (format(int(time.time() * 1000), "x")
+            + "".join(random.choices(string.ascii_lowercase + string.digits, k=10)))
+
+
+def narto_session():
+    s = new_session()
+    ck = _nd_ck()
+    for dom in ("narto-drama.com", "nartodrama.com"):
+        s.cookies.set("nd_ck", ck, domain=dom)
+    s.headers.update({"User-Agent": NARTO_UA,
+                      "Referer": NARTO_MAIN + "/"})
+    return s
+
+
+def narto_sections(sess, provider, page=1):
+    """实时拉取某片源剧场列表（for-you + feed-stream，每页 15 条）"""
+    params = {"provider": provider, "lang": NARTO_LANG}
+    if page > 1:
+        params["tab_pages[for-you]"] = str(page)
+        params["tab_pages[feed-stream]"] = str(page)
+    r = sess.get(NARTO_MAIN + "/home/providers/sections", params=params,
+                 timeout=30)
+    d = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {}
+    items = []
+    for sec in d.get("sections") or []:
+        items += sec.get("items") or []
+    return items
+
+
+def narto_provider_keys(sess):
+    try:
+        r = sess.get(NARTO_MAIN + "/home/providers/sections",
+                     params={"lang": NARTO_LANG}, timeout=30)
+        return [p.get("key") for p in (r.json().get("providers") or []) if p.get("key")]
+    except Exception:
+        return ["bibishort"]
+
+
+def narto_resolve(url):
+    """解析 Narto 播放页（/detail/watch/<slug> 或 /search/import?…）→
+    剧名 + 全部分集（分集直链在下载时经 refresh-source 实时获取）"""
+    sess = narto_session()
+    url = (url or "").strip()
+    if "search/import" in url:
+        r = sess.get(url, timeout=40, allow_redirects=True)
+        url = r.url
+    m = re.search(r"/detail/watch/([a-z0-9-]+)", url)
+    if not m:
+        raise RuntimeError("未能识别 Narto Drama 播放页链接（应形如 "
+                           "narto-drama.com/detail/watch/<slug>）")
+    slug = m.group(1)
+    page_url = f"{NARTO_MAIN}/detail/watch/{slug}?lang={NARTO_LANG}"
+    r = sess.get(page_url, timeout=40)
+    if r.status_code != 200:
+        raise RuntimeError(f"Narto Drama 页面打开失败 HTTP {r.status_code}")
+    html = r.text
+    title = ""
+    tm = re.search(r"<title>(.*?)</title>", html, re.S)
+    if tm:
+        title = re.sub(r"\s*-\s*免費觀看.*$", "", tm.group(1)).strip()
+    nums = {int(x) for x in
+            re.findall(re.escape(slug) + r"/(\d+)\?", html)}
+    total = max(nums) if nums else 1
+    eps = {no: {"slug": slug} for no in range(1, total + 1)}
+    return {"id": slug, "title": title or slug, "official_eps": total,
+            "platform": "narto", "platform_name": "Narto Drama",
+            "watch_url": page_url, "eps": eps}
+
+
+def narto_play_url(slug, no, sess=None):
+    """经边缘域 refresh-source 端点实时取分集 MP4 直链（免登录）"""
+    sess = sess or narto_session()
+    u = (f"{NARTO_EDGE}/e/rs/detail/watch/{slug}/{no}/refresh-source"
+         f"?lang={NARTO_LANG}")
+    r = sess.get(u, headers={"Accept": "application/json"}, timeout=40)
+    d = r.json()
+    if not d.get("ok") or not d.get("play_url"):
+        raise RuntimeError(d.get("message") or "refresh-source 未返回播放地址")
+    return d["play_url"]
+
+
+def narto_download(eps, out_dir, log=None, progress=None):
+    """逐集实时解析直链 + ffmpeg 无损转存（4 并发）"""
+    os.makedirs(out_dir, exist_ok=True)
+    fails = []
+    sess = narto_session()
+    slugs = {no: src.get("slug") for no, src in eps.items()}
+
+    def resolve_one(no):
+        try:
+            return no, narto_play_url(slugs[no], no, sess)
+        except Exception as e:
+            return no, None
+
+    import concurrent.futures as cf
+    urls = {}
+    total = len(eps)
+    with cf.ThreadPoolExecutor(4) as ex:
+        for no, u in ex.map(resolve_one, sorted(eps)):
+            urls[no] = u
+            if not u:
+                fails.append(no)
+                if progress:
+                    progress(no, "ERR 未取到播放地址", len(urls), total)
+    if log:
+        log(f"[Narto] 已解析 {total - len(fails)}/{total} 集直链，开始无损转存")
+
+    dl_eps = {no: {"mp4": u} for no, u in urls.items() if u}
+    fails2 = DramaTool().download_eps(dl_eps, out_dir, progress, workers=4)
+    return sorted(set(fails) | set(fails2))
 
 
 def panel_index():
@@ -541,6 +668,55 @@ class DramaTool:
         hits.sort(key=lambda x: -x["ratio"])
         return hits[:limit]
 
+    def search_narto(self, keyword, limit=8):
+        """实时检索 Narto Drama 多剧场片源（免登录）：
+        走 SSR 首页（tab-provider + page，JSON-LD 清单，每页 24 条、零重叠），
+        目标片源拉全部页、其余剧场拉第 1 页，本地标题过滤。
+        返回候选（含 watch_url，可直接定位播放页）。"""
+        sess = narto_session()
+        providers = narto_provider_keys(sess)
+        kw = (keyword or "").lower().replace("’", "'").strip()
+
+        def fetch_pg(pv_pg):
+            pv, pg = pv_pg
+            try:
+                r = sess.get(NARTO_MAIN, params={
+                    "lang": NARTO_LANG, "tab-provider": pv, "page": pg},
+                    timeout=40)
+                return pv, re.findall(
+                    r'"@type":"ListItem","position":\d+,'
+                    r'"url":"([^"]+)","name":"([^"]+)"', r.text)
+            except Exception:
+                return pv, []
+
+        import concurrent.futures as cf
+        plans = [(p, 1) for p in providers] + [("bibishort", n) for n in (2, 3, 4)]
+        cands, seen = [], set()
+        with cf.ThreadPoolExecutor(8) as ex:
+            for pv, lst in ex.map(fetch_pg, plans):
+                for u, title in lst:
+                    slug = u.split("/detail/watch/")[1].split("?")[0]
+                    if slug in seen:
+                        continue
+                    seen.add(slug)
+                    ratio = difflib.SequenceMatcher(
+                        None, kw, title.lower()).ratio()
+                    if kw in title.lower() or ratio > 0.45:
+                        cands.append({
+                            "ratio": round(ratio, 3), "app": f"narto·{pv}",
+                            "title": title.split(") ", 1)[-1] if ") " in title
+                            else title,
+                            "watch_url": f"{NARTO_MAIN}/detail/watch/{slug}"
+                                         f"?lang={NARTO_LANG}",
+                            "book_id": slug, "episode_count": "",
+                            "playlet_id": slug})
+        if not seen:
+            raise RuntimeError("Narto 片源列表拉取失败（0 条）")
+        self.log(f"[Narto] 实时拉取 {len(providers)} 剧场 {len(seen)} 部，"
+                 f"标题命中 {len(cands)} 条")
+        cands.sort(key=lambda x: -x["ratio"])
+        return cands[:limit]
+
     def download_eps(self, eps, out_dir, progress_fn=None, workers=4):
         os.makedirs(out_dir, exist_ok=True)
         fails = []
@@ -778,6 +954,17 @@ def job_search(payload):
             set_status(f"已就绪：《{drama['title']}》({drama['official_eps']} 集，"
                        f"{pname}) —— 可开始下载", busy=False)
             return
+        if pkey == "narto":
+            TOOL.log(f"[平台] 识别为 {pname}，解析播放页与分集…")
+            drama = narto_resolve(text)
+            STATE.current = drama
+            STATE.download_dir = None
+            STATE.result = None
+            TOOL.log(f"[结果] 《{drama['title']}》 {drama['official_eps']} 集"
+                     f"（{pname}，直链下载）")
+            set_status(f"已就绪：《{drama['title']}》({drama['official_eps']} 集，"
+                       f"{pname}) —— 可开始下载", busy=False)
+            return
         if pkey and pkey != "yc":
             TOOL.log(f"[平台] 识别为 {pname}（{pkey}），本版下载适配支持 "
                      f"YourChannel / NetShort 两个平台；该平台暂仅做识别")
@@ -809,6 +996,12 @@ def job_search(payload):
                              f"（11 平台上新面板，仅剧名/日期，无播放 ID）")
             except Exception as e:
                 TOOL.log(f"[面板索引] 不可用: {e}")
+            try:
+                narto_hits = TOOL.search_narto(kw)
+                if narto_hits:
+                    cands = narto_hits + cands
+            except Exception as e:
+                TOOL.log(f"[Narto] 实时检索不可用: {e}")
             if not cands:
                 TOOL.log("[结果] 未找到匹配剧目。")
                 TOOL.log("  原因说明：YourChannel 官网搜索接口已停用（实测），")
@@ -848,6 +1041,22 @@ def job_search(payload):
         set_status(f"搜索失败: {e}", busy=False)
 
 
+def job_fetch_narto(url):
+    set_status("解析 Narto Drama 播放页…", busy=True)
+    try:
+        drama = narto_resolve(url)
+        STATE.current = drama
+        STATE.download_dir = None
+        STATE.result = None
+        TOOL.log(f"[结果] 《{drama['title']}》 {drama['official_eps']} 集"
+                 f"（Narto Drama，直链下载）")
+        set_status(f"已就绪：《{drama['title']}》({drama['official_eps']} 集) "
+                   f"—— 可开始下载", busy=False)
+    except Exception as e:
+        TOOL.log(f"[错误] {e}")
+        set_status(f"解析失败: {e}", busy=False)
+
+
 def job_fetch(pid):
     set_status(f"获取剧目 {pid} …", busy=True)
     try:
@@ -884,6 +1093,9 @@ def job_download(payload):
         if drama.get("platform") == "netshort":
             TOOL.log(f"[平台] NetShort：逐集解析签名直链（本机 Edge 驱动）")
             fails = netshort_download(drama["eps"], out, prog)
+        elif drama.get("platform") == "narto":
+            TOOL.log(f"[平台] Narto Drama：逐集实时解析直链（免浏览器）")
+            fails = narto_download(drama["eps"], out, TOOL.log, prog)
         else:
             fails = TOOL.download_eps(drama["eps"], out, prog)
         if fails:
@@ -963,9 +1175,9 @@ th{background:#1b2130;color:#9fb6d9}
 .st{color:#8ea2bd;font-size:13px;margin:6px 0}
 .ok{color:#4fd07a} .warn{color:#ffb14f} .err{color:#ff6b6b}
 </style></head><body>
-<h1>🎬 YC Drama Downloader <small style="font-size:12px;color:#8ea2bd">YourChannel 短剧下载与合成</small></h1>
+<h1>🎬 Short Drama Downloader <small style="font-size:12px;color:#8ea2bd">YourChannel · NetShort · Narto Drama 短剧下载与合成</small></h1>
 <div class="row">
-  <input id="q" type="text" placeholder="剧名 / 播放页URL（YourChannel·NetShort）/ playlet_id / 北斗任务链接">
+  <input id="q" type="text" placeholder="剧名 / 播放页URL（YourChannel·NetShort·Narto Drama）/ playlet_id / 北斗任务链接">
   <button onclick="doSearch()">搜索</button>
   <button class="gray" onclick="doClearResult()">清除结果</button>
 </div>
@@ -987,8 +1199,8 @@ th{background:#1b2130;color:#9fb6d9}
 <div class="st" id="st">初始化…</div>
 <table id="cands" style="display:none"><thead><tr><th>匹配度</th><th>平台</th><th>剧名</th><th>集数</th><th>playlet_id</th><th></th></tr></thead><tbody></tbody></table>
 <div id="log"></div>
-<p style="color:#66708a;font-size:12px">支持平台：<b>YourChannel</b>（API 直连）、<b>NetShort</b>（播放页链接，签名直链由本机 Edge 解析）；其余 9 个剧场（ShortMax / DramaBox / ReelShort / StardustTV / KalosTV / GoodShort / FlickReels / MoboReels / StoryReel）可识别并跨平台检索，下载适配持续推进。<br>
-提示：YourChannel 官网搜索接口已停用（实测），剧名搜索为实时全局检索北斗任务池（7 平台 × 各 200 条）+ 11 平台上新面板索引；新剧请直接粘贴播放页链接或北斗任务链接。</p>
+<p style="color:#66708a;font-size:12px">支持平台：<b>YourChannel</b>（API 直连）、<b>NetShort</b>（播放页链接，签名直链由本机 Edge 解析）、<b>Narto Drama 多剧场</b>（播放页链接直连，含 BibiShort 等 35+ 片源，直链下载）；其余剧场（ShortMax / DramaBox / ReelShort / StardustTV / KalosTV / GoodShort / FlickReels / MoboReels / StoryReel）可识别并跨平台检索，下载适配持续推进。<br>
+提示：剧名搜索为实时检索——北斗任务池（7 平台 × 各 200 条）+ 11 平台上新面板索引 + Narto Drama 多剧场片源（免登录，候选可一键「用此剧」）；新剧也可直接粘贴播放页链接或北斗任务链接。</p>
 <script>
 let timer=null;
 function fmt(){return (new Date).toLocaleTimeString('zh-CN',{hour12:false})}
@@ -1004,6 +1216,7 @@ async function doMerge(){await post('/api/merge',{})}
 async function doExport(){const d=await post('/api/export_log',{path:document.getElementById('expath').value});if(d.path)alert('日志已导出:\\n'+d.path)}
 function openDir(){post('/api/open_dir',{out:document.getElementById('out').value})}
 function usePid(el){post('/api/fetch',{id:el.getAttribute('data-pid')})}
+function useNarto(el){post('/api/fetch_narto',{url:el.getAttribute('data-url')})}
 async function poll(){
   try{const r=await fetch('/api/status');const s=await r.json();
   document.getElementById('st').textContent=s.status;
@@ -1020,7 +1233,7 @@ async function poll(){
       tb.innerHTML='';tb.dataset.n=String(s.result.candidates.length);
       for(const c of s.result.candidates){
         const tr=document.createElement('tr');
-        tr.innerHTML=`<td>${c.ratio}</td><td>${c.app}</td><td>${c.title}</td><td>${c.episode_count||''}</td><td>${c.playlet_id||''}</td><td>${c.app==='yourchannel_drama'?'<button onclick=usePid(this) data-pid="'+c.playlet_id+'">用此剧</button>':'<span style="color:#66708a">非YC源</span>'}</td>`;
+        tr.innerHTML=`<td>${c.ratio}</td><td>${c.app}</td><td>${c.title}</td><td>${c.episode_count||''}</td><td>${c.playlet_id||''}</td><td>${c.app==='yourchannel_drama'?'<button onclick=usePid(this) data-pid="'+c.playlet_id+'">用此剧</button>':(c.watch_url?'<button onclick=useNarto(this) data-url="'+c.watch_url+'">用此剧</button>':'<span style="color:#66708a">仅识别</span>')}</td>`;
         tb.appendChild(tr)}}
   } else {document.getElementById('cands').style.display='none';tb.dataset.n='0'}
   }catch(e){}
@@ -1077,6 +1290,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif self.path == "/api/fetch":
             threading.Thread(target=job_fetch, args=(payload.get("id"),),
+                             daemon=True).start()
+            self._json({"ok": True})
+        elif self.path == "/api/fetch_narto":
+            threading.Thread(target=job_fetch_narto,
+                             args=(payload.get("url"),),
                              daemon=True).start()
             self._json({"ok": True})
         elif self.path == "/api/download":
