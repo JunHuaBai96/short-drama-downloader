@@ -4,10 +4,10 @@
 
 ## ✨ 功能
 
-- **多平台识别**：自动识别 11 个短剧剧场域名（YourChannel / NetShort / ShortMax / DramaBox / ReelShort / StardustTV / KalosTV / GoodShort / FlickReels / MoboReels / StoryReel）
-- **下载适配**：YourChannel（API 直连）、NetShort（播放页链接，签名直链由本机 Edge 解析）；其余平台持续适配中
+- **多平台识别**：自动识别 13 个短剧剧场域名（YourChannel / NetShort / Narto Drama / ShortMax / DramaBox / ReelShort / StardustTV / KalosTV / GoodShort / FlickReels / MoboReels / StoryReel 等）
+- **下载适配**：YourChannel（API 直连）、NetShort（播放页链接，签名直链由本机 Edge 解析）、**Narto Drama 多剧场**（播放页链接直连，免登录免浏览器，覆盖 BibiShort 等 35+ 片源剧场）；其余平台持续适配中
 - **四种输入**：剧名（实时全局检索）/ 播放页 URL / playlet_id / 北斗任务链接（`inbeidou.cn/task-detail?task_id=…` 自动定位取剧）
-- **实时全局检索**：搜索时实时拉取北斗任务池全量窗口（7 平台 × 各 200 条）+ 11 平台上新面板索引；YourChannel 官网搜索接口已停用（实测），北斗任务池是唯一可检索数据源
+- **实时检索**：搜索时实时拉取北斗任务池全量窗口（7 平台 × 各 200 条）+ 11 平台上新面板索引 + **Narto Drama 多剧场片源**（SSR 全量分页直连，候选可一键「用此剧」）；YourChannel 官网搜索接口已停用（实测），北斗任务池与 Narto 片源列表均为实时通道
 - **原档下载**：优先原档 MP4（720p/1080p，按片源实际分辨率），失败自动回落 HLS 流；字幕为画面烧录式，随视频获取
 - **防漏集校验**：逐集体积/时长/可解码校验，并与官方总集数比对
 - **无损合成**：concat 流复制拼接（零转码损失），合成前自动归一化各集时间戳（片源视频轨普遍带 +0.16s 头部偏移 + 片尾静音填充，直接拼接会在每个接缝产生约 0.19 秒的可见卡顿，工具已修复），成片 `FULL.mp4` 与分集保存在同一输出目录
@@ -28,6 +28,7 @@
 1. **输入剧目**：
    - YourChannel：粘贴播放页链接（`yourchannel.ai/pagesSub/player?id=…`）或北斗任务链接
    - NetShort：粘贴播放页链接（`web.netshort.com/episode/<slug>-<id>`），工具自动枚举全部分集
+   - Narto Drama：粘贴播放页链接（`narto-drama.com/detail/watch/<slug>`，含 BibiShort 等片源的 `/search/import` 导入链接），工具自动枚举全部分集并直链下载
    - 剧名搜索为实时检索北斗任务池 + 面板索引（新上架剧可能不在池中，此时用链接直连）
 2. **开始下载**：输出目录支持「浏览」选择，分集与合成成片均保存在此目录，进度实时显示
 3. **合成**：下载校验通过后点「合成为完整视频」，成片 `FULL.mp4` 与分集在同一目录
@@ -37,6 +38,7 @@
 
 - YourChannel 官网搜索接口已停用（实测任何参数均返回「短剧未找到」），剧名检索走北斗智影（inbeidou.cn）任务池
 - NetShort 接口对请求/响应做了加密处理，工具不逆向加密，而是用本机 Edge 以真实浏览器取播放器实际请求的签名直链（有效期数小时）
+- Narto Drama 为多剧场聚合站（BibiShort / MicroDrama 等 35+ 片源）：分集直链经其边缘域 refresh-source 端点实时获取，免登录；其站内搜索接口需登录，剧名检索改走片源列表全量分页 + 本地标题过滤（候选一键「用此剧」直接定位播放页）
 - 成片为片源原始编码（H.264/HEVC），主流播放器直接可播；部分旧版剪辑软件需转码
 - 仅支持上述平台的公开剧集；字幕为片源烧录式，工具不生成独立字幕文件
 - 请遵守各平台服务条款，下载内容仅限授权范围内的内部素材使用
