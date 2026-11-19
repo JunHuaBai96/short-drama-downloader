@@ -322,21 +322,34 @@ def narto_resolve(url):
     nums = {int(x) for x in
             re.findall(re.escape(slug) + r"/(\d+)\?", html)}
     total = max(nums) if nums else 1
+    # 权威分集数：播放页 SSR 内嵌 episodeItemsRaw（后端 episode 表）
+    raw = re.search(r'const episodeItemsRaw = (\[.*?\]);\s*\n', html, re.S)
+    if raw:
+        try:
+            n = len(json.loads(raw.group(1)))
+            if n > 0:
+                total = n
+        except Exception:
+            pass
     eps = {no: {"slug": slug} for no in range(1, total + 1)}
     return {"id": slug, "title": title or slug, "official_eps": total,
             "platform": "narto", "platform_name": "Narto Drama",
             "watch_url": page_url, "eps": eps}
 
 
-def narto_play_url(slug, no, sess=None):
-    """经边缘域 refresh-source 端点实时取分集 MP4 直链（免登录，含 3 次重试）"""
+def narto_play_url(slug, no, sess=None, force_edge=False):
+    """经边缘域 refresh-source 端点实时取分集直链（免登录，含 3 次重试）。
+    force_edge=True 时加 force=1&force_edge=1&no_cache=1，要求后端
+    返回站方边缘代理流（moviebox-edge/stream 边缘），用于直链 CDN
+    被 CloudFront 拦截（428）的场景——与站点播放器自身降级逻辑一致。"""
     sess = sess or narto_session()
+    extra = "&force=1&force_edge=1&no_cache=1" if force_edge else ""
     u = (f"{NARTO_EDGE}/e/rs/detail/watch/{slug}/{no}/refresh-source"
-         f"?lang={NARTO_LANG}")
+         f"?lang={NARTO_LANG}{extra}")
     last_err = None
     for attempt in range(3):
         try:
-            r = sess.get(u, headers={"Accept": "application/json"}, timeout=40)
+            r = sess.get(u, headers={"Accept": "application/json"}, timeout=90)
             d = r.json()
             if d.get("ok") and d.get("play_url"):
                 return d["play_url"]
@@ -347,33 +360,57 @@ def narto_play_url(slug, no, sess=None):
     raise RuntimeError(f"refresh-source 第 {no} 集失败: {last_err}")
 
 
+def narto_probe(url, sess=None):
+    """轻量探测直链可用性（Range 取 1KB）。直链 CDN（如 hakunaymatata 的
+    CloudFront）可能返回 428/403——与浏览器播放行为一致，需降级到边缘流。"""
+    sess = sess or narto_session()
+    try:
+        r = sess.get(url, headers={"Range": "bytes=0-1023",
+                                   "User-Agent": NARTO_UA,
+                                   "Referer": NARTO_MAIN + "/"},
+                     timeout=20, stream=True)
+        ok = r.status_code in (200, 206)
+        r.close()
+        return ok
+    except Exception:
+        return False
+
+
 def narto_download(eps, out_dir, log=None, progress=None):
-    """逐集实时解析直链 + ffmpeg 无损转存（4 并发）"""
+    """逐集实时解析直链 + ffmpeg 无损转存（4 并发）。
+    直链探测失败（如 CloudFront 428）自动降级站方边缘代理流。"""
     os.makedirs(out_dir, exist_ok=True)
     fails = []
     sess = narto_session()
     slugs = {no: src.get("slug") for no, src in eps.items()}
+    ref = NARTO_MAIN + "/"
 
     def resolve_one(no):
+        slug = slugs[no]
         try:
-            return no, narto_play_url(slugs[no], no, sess)
-        except Exception as e:
+            u = narto_play_url(slug, no, sess)
+            if narto_probe(u, sess):
+                return no, {"mp4": u, "referer": ref}
+            # 直链 CDN 拒绝（428/403 等）→ 强制边缘代理流（站点同款降级）
+            u2 = narto_play_url(slug, no, sess, force_edge=True)
+            return no, {"mp4": u2 or u, "referer": ref}
+        except Exception:
             return no, None
 
     import concurrent.futures as cf
     urls = {}
     total = len(eps)
+    edge_used = 0
     with cf.ThreadPoolExecutor(4) as ex:
-        for no, u in ex.map(resolve_one, sorted(eps)):
-            urls[no] = u
-            if not u:
+        for no, src in ex.map(resolve_one, sorted(eps)):
+            urls[no] = src
+            if not src:
                 fails.append(no)
                 if progress:
                     progress(no, "ERR 未取到播放地址", len(urls), total)
+    dl_eps = {no: src for no, src in urls.items() if src}
     if log:
         log(f"[Narto] 已解析 {total - len(fails)}/{total} 集直链，开始无损转存")
-
-    dl_eps = {no: {"mp4": u} for no, u in urls.items() if u}
     fails2 = DramaTool().download_eps(dl_eps, out_dir, progress, workers=4)
     return sorted(set(fails) | set(fails2))
 
@@ -753,11 +790,12 @@ class DramaTool:
             f = os.path.join(out_dir, f"ep{no:02d}.mp4").replace("\\", "/")
             if os.path.exists(f) and os.path.getsize(f) > 500_000:
                 return no, "skip(已存在)"
+            ref = src.get("referer") or "https://yourchannel.ai/"
             for tag, url in (("mp4", src.get("mp4")), ("m3u8", src.get("m3u8"))):
                 if not url:
                     continue
                 cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-                       "-headers", "Referer: https://yourchannel.ai/\r\n"
+                       "-headers", f"Referer: {ref}\r\n"
                        "User-Agent: Mozilla/5.0\r\n",
                        "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc",
                        "-movflags", "+faststart", f]
@@ -1233,7 +1271,7 @@ th{background:#1b2130;color:#9fb6d9}
 <table id="cands" style="display:none"><thead><tr><th>匹配度</th><th>平台</th><th>剧名</th><th>集数</th><th>playlet_id</th><th></th></tr></thead><tbody></tbody></table>
 <div id="log"></div>
 <p style="color:#66708a;font-size:12px">支持平台：<b>YourChannel</b>（API 直连）、<b>NetShort</b>（播放页链接，签名直链由本机 Edge 解析）、<b>Narto Drama 多剧场</b>（播放页链接直连，含 BibiShort 等 35+ 片源，直链下载）；其余剧场（ShortMax / DramaBox / ReelShort / StardustTV / KalosTV / GoodShort / FlickReels / MoboReels / StoryReel）可识别并跨平台检索，下载适配持续推进。<br>
-提示：剧名搜索为实时检索——北斗任务池（8 平台 × 各 200 条）+ 11 平台上新面板索引 + Narto Drama 站内搜索（免登录，候选可一键「用此剧」）；北斗非 YC 源任务（dramawave / dramabox 等）链接可自动定位到 Narto 对应片源；新剧也可直接粘贴播放页链接或北斗任务链接。</p>
+提示：剧名搜索为实时检索——北斗任务池（8 平台 × 各 200 条）+ 11 平台上新面板索引 + Narto Drama 站内搜索（免登录，候选可一键「用此剧」）；北斗非 YC 源任务（dramawave / dramabox 等）链接可自动定位到 Narto 对应片源；新剧也可直接粘贴播放页链接或北斗任务链接。Narto 片源直链若被源站 CDN 拦截（实测部分片源返回 428），工具自动降级为站方边缘代理流（与站点播放器行为一致），逐集实时解析、下载失败集可重跑补齐。</p>
 <script>
 let timer=null;
 function fmt(){return (new Date).toLocaleTimeString('zh-CN',{hour12:false})}
