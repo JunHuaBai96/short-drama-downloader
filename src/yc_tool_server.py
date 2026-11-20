@@ -222,14 +222,13 @@ def netshort_download(eps, out_dir, log=None, progress=None):
                     if progress:
                         progress(no, "ERR 未取到播放地址", i, total)
                     continue
-                cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                cmd = [FFMPEG, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                        "-headers", "Referer: https://web.netshort.com/\r\n"
                        f"User-Agent: {NS_UA}\r\n",
                        "-i", media, "-c", "copy", "-bsf:a", "aac_adtstoasc",
                        "-movflags", "+faststart", f]
-                r = subprocess.run(cmd, capture_output=True, text=True,
-                                   env=ENV_NO_PROXY, timeout=300)
-                if r.returncode == 0 and os.path.exists(f) and \
+                rc, _err = ff_run(cmd, 300)
+                if rc == 0 and os.path.exists(f) and \
                         os.path.getsize(f) > 500_000:
                     if progress:
                         progress(no, f"ok {os.path.getsize(f)//1048576}MB", i, total)
@@ -337,8 +336,14 @@ def narto_resolve(url):
             "watch_url": page_url, "eps": eps}
 
 
+# 全局限流：多任务并行时所有 Narto 请求共享这一配额（跨任务）。
+# 实测 2 个任务各 4 并发（8 路同时打边缘域）会被站点限流，refresh-source
+# 大量超时返回空 → 每集 3×90s 重试无限拖长。限到 4 路后稳定。
+NARTO_REQ = threading.Semaphore(4)
+
+
 def narto_play_url(slug, no, sess=None, force_edge=False):
-    """经边缘域 refresh-source 端点实时取分集直链（免登录，含 3 次重试）。
+    """经边缘域 refresh-source 端点实时取分集直链（免登录，含重试）。
     force_edge=True 时加 force=1&force_edge=1&no_cache=1，要求后端
     返回站方边缘代理流（moviebox-edge/stream 边缘），用于直链 CDN
     被 CloudFront 拦截（428）的场景——与站点播放器自身降级逻辑一致。"""
@@ -349,7 +354,15 @@ def narto_play_url(slug, no, sess=None, force_edge=False):
     last_err = None
     for attempt in range(3):
         try:
-            r = sess.get(u, headers={"Accept": "application/json"}, timeout=90)
+            with NARTO_REQ:
+                r = sess.get(u, headers={"Accept": "application/json"},
+                             timeout=60)
+            if r.status_code == 429:
+                # 站点冷却：refresh_source_recently_failed / cooldown_active，
+                # 立刻重试只会继续 429，必须退避后再来
+                last_err = RuntimeError("429 冷却: " + r.text[:80])
+                time.sleep(15 * (attempt + 1))
+                continue
             d = r.json()
             if d.get("ok") and d.get("play_url"):
                 return d["play_url"]
@@ -365,10 +378,11 @@ def narto_probe(url, sess=None):
     CloudFront）可能返回 428/403——与浏览器播放行为一致，需降级到边缘流。"""
     sess = sess or narto_session()
     try:
-        r = sess.get(url, headers={"Range": "bytes=0-1023",
-                                   "User-Agent": NARTO_UA,
-                                   "Referer": NARTO_MAIN + "/"},
-                     timeout=20, stream=True)
+        with NARTO_REQ:
+            r = sess.get(url, headers={"Range": "bytes=0-1023",
+                                       "User-Agent": NARTO_UA,
+                                       "Referer": NARTO_MAIN + "/"},
+                         timeout=20, stream=True)
         ok = r.status_code in (200, 206)
         r.close()
         return ok
@@ -376,7 +390,7 @@ def narto_probe(url, sess=None):
         return False
 
 
-def narto_download(eps, out_dir, log=None, progress=None):
+def narto_download(eps, out_dir, log=None, progress=None, should_stop=None):
     """逐集实时解析直链 + ffmpeg 无损转存（4 并发）。
     直链探测失败（如 CloudFront 428）自动降级站方边缘代理流。"""
     os.makedirs(out_dir, exist_ok=True)
@@ -385,29 +399,60 @@ def narto_download(eps, out_dir, log=None, progress=None):
     slugs = {no: src.get("slug") for no, src in eps.items()}
     ref = NARTO_MAIN + "/"
 
-    def resolve_one(no):
+    def resolve_one(no, sess_):
         slug = slugs[no]
         try:
-            u = narto_play_url(slug, no, sess)
-            if narto_probe(u, sess):
-                return no, {"mp4": u, "referer": ref}
+            u = narto_play_url(slug, no, sess_)
+            if narto_probe(u, sess_):
+                return no, {"mp4": u, "referer": ref}, ""
             # 直链 CDN 拒绝（428/403 等）→ 强制边缘代理流（站点同款降级）
-            u2 = narto_play_url(slug, no, sess, force_edge=True)
-            return no, {"mp4": u2 or u, "referer": ref}
-        except Exception:
-            return no, None
+            time.sleep(1.5)   # 别紧接着二次打点，容易触发站点 429 冷却
+            try:
+                u2 = narto_play_url(slug, no, sess_, force_edge=True)
+                return no, {"mp4": u2 or u, "referer": ref}, ""
+            except Exception:
+                # 降级请求失败（429/超时）时先用原直链试，别整集判死
+                return no, {"mp4": u, "referer": ref}, ""
+        except Exception as e:
+            return no, None, str(e)[:140]
 
     import concurrent.futures as cf
-    urls = {}
+    urls, errs = {}, {}
     total = len(eps)
-    edge_used = 0
-    with cf.ThreadPoolExecutor(4) as ex:
-        for no, src in ex.map(resolve_one, sorted(eps)):
+    ex = cf.ThreadPoolExecutor(4)
+    try:
+        for no, src, err in ex.map(lambda n: resolve_one(n, sess), sorted(eps)):
+            if should_stop and should_stop():
+                raise TaskCanceled()
             urls[no] = src
             if not src:
                 fails.append(no)
+                errs[no] = err
                 if progress:
                     progress(no, "ERR 未取到播放地址", len(urls), total)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    # 第二轮补拉：并发抢站点时偶发空返回，串行 + 新 session + 退避重试
+    if fails:
+        if log:
+            log(f"[Narto] 首轮 {len(fails)} 集直链失败 {sorted(fails)}，串行补拉…")
+        s2 = narto_session()
+        still = []
+        for no in sorted(fails):
+            time.sleep(6)   # 站点对失败集有冷却，间隔太短只会继续 429
+            _n, src, err = resolve_one(no, s2)
+            if src:
+                urls[no] = src
+                fails.remove(no)
+                errs.pop(no, None)
+                if log:
+                    log(f"[Narto] ep{no:02d} 补拉成功")
+            else:
+                still.append(no)
+                errs[no] = err
+        for no in still:
+            if log:
+                log(f"[Narto] ep{no:02d} 补拉仍失败：{errs.get(no)}")
     dl_eps = {no: src for no, src in urls.items() if src}
     if log:
         log(f"[Narto] 已解析 {total - len(fails)}/{total} 集直链，开始无损转存")
@@ -509,6 +554,32 @@ def find_ffmpeg():
 
 FFMPEG = find_ffmpeg()
 ENV_NO_PROXY = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+
+
+def ff_run(cmd, timeout=300):
+    """运行 ffmpeg，返回 (returncode, stderr 文本)。
+    stderr 写临时文件而不是 PIPE：多线程并发起子进程时，PIPE 句柄会被
+    其他线程的子进程继承，父进程 read 不到 EOF → 卡死（Windows 实测，
+    表现为 merge 卡在 merging 且无 ffmpeg 进程）。"""
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="ff_", suffix=".log")
+    os.close(fd)
+    try:
+        with open(path, "wb") as fe:
+            r = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=fe,
+                               env=ENV_NO_PROXY, timeout=timeout)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fr:
+                txt = fr.read()
+        except Exception:
+            txt = ""
+        return r.returncode, txt
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def new_session():
@@ -794,17 +865,16 @@ class DramaTool:
             for tag, url in (("mp4", src.get("mp4")), ("m3u8", src.get("m3u8"))):
                 if not url:
                     continue
-                cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                cmd = [FFMPEG, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                        "-headers", f"Referer: {ref}\r\n"
                        "User-Agent: Mozilla/5.0\r\n",
                        "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc",
                        "-movflags", "+faststart", f]
                 try:
-                    r = subprocess.run(cmd, capture_output=True, text=True,
-                                       env=ENV_NO_PROXY, timeout=300)
+                    rc, _err = ff_run(cmd, 300)
                 except subprocess.TimeoutExpired:
-                    r = None
-                if r is not None and r.returncode == 0 and \
+                    rc = -1
+                if rc == 0 and \
                         os.path.exists(f) and os.path.getsize(f) > 500_000:
                     return no, f"ok[{tag}] {os.path.getsize(f)//1048576}MB"
                 if os.path.exists(f):
@@ -813,7 +883,8 @@ class DramaTool:
 
         import concurrent.futures as cf
         done = 0
-        with cf.ThreadPoolExecutor(workers) as ex:
+        ex = cf.ThreadPoolExecutor(workers)
+        try:
             futs = {ex.submit(dl_one, no, src): no for no, src in eps.items()}
             for fut in cf.as_completed(futs):
                 no, st = fut.result()
@@ -822,6 +893,9 @@ class DramaTool:
                     progress_fn(no, st, done, len(eps))
                 if st.startswith("ERR"):
                     fails.append(no)
+        finally:
+            # 取消/异常时不再等剩余集跑完（已在跑的 ffmpeg 自行结束）
+            ex.shutdown(wait=False, cancel_futures=True)
         for no in list(fails):
             no2, st = dl_one(no, eps[no])
             if not st.startswith("ERR"):
@@ -838,9 +912,8 @@ class DramaTool:
                 bad.append(no)
                 continue
             try:
-                r = subprocess.run([FFMPEG, "-hide_banner", "-i", f],
-                                   capture_output=True, text=True, timeout=60)
-                if "Duration:" not in r.stderr:
+                rc, err = ff_run([FFMPEG, "-nostdin", "-hide_banner", "-i", f], 60)
+                if "Duration:" not in err:
                     bad.append(no)
             except Exception:
                 bad.append(no)
@@ -851,14 +924,13 @@ class DramaTool:
         pts, tbn = 0.0, None
         try:
             import re
-            r = subprocess.run(
-                [FFMPEG, "-hide_banner", "-i", f, "-vf", "showinfo",
-                 "-an", "-frames:v", "1", "-f", "null", "-"],
-                capture_output=True, text=True, timeout=60)
-            m = re.search(r"(\d+) tbn", r.stderr)
+            _rc, err = ff_run(
+                [FFMPEG, "-nostdin", "-hide_banner", "-i", f, "-vf", "showinfo",
+                 "-an", "-frames:v", "1", "-f", "null", "-"], 60)
+            m = re.search(r"(\d+) tbn", err)
             if m:
                 tbn = int(m.group(1))
-            for line in r.stderr.splitlines():
+            for line in err.splitlines():
                 if "pts_time:" in line:
                     pts = float(line.split("pts_time:")[1].split(" ")[0])
                     break
@@ -868,10 +940,9 @@ class DramaTool:
 
     def _container_dur(self, f):
         try:
-            r = subprocess.run([FFMPEG, "-hide_banner", "-i", f],
-                               capture_output=True, text=True, timeout=60)
+            _rc, err = ff_run([FFMPEG, "-nostdin", "-hide_banner", "-i", f], 60)
             import re
-            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr)
+            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
             if m:
                 return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
         except Exception:
@@ -886,16 +957,18 @@ class DramaTool:
         音频静音填充。全程零转码。失败回退原文件。"""
         dst = src[:-4] + "._ns.mp4"
         dur = self._container_dur(src)
-        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        cmd = [FFMPEG, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                "-itsoffset", str(-offset), "-i", src, "-i", src,
                "-map", "0:v", "-map", "1:a", "-c", "copy",
                "-video_track_timescale", "15360"]
         if dur:
             cmd += ["-t", str(round(dur - offset - 0.02, 3))]
         cmd += ["-movflags", "+faststart", dst]
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           env=ENV_NO_PROXY, timeout=300)
-        if r.returncode != 0 or not os.path.exists(dst):
+        try:
+            rc, _err = ff_run(cmd, 300)
+        except subprocess.TimeoutExpired:
+            rc = -1
+        if rc != 0 or not os.path.exists(dst):
             return src          # 修复失败时回退原文件（不影响合成）
         return dst
 
@@ -905,6 +978,11 @@ class DramaTool:
         一致会造成跳帧与大空洞）③截除片尾音频静音填充。"""
         use, tmps = {}, []
         eps_sorted = sorted(eps)
+        # 缺集会静默合成出不完整成片（concat 跳过不存在文件仍返回 0），先拦住
+        missing = [no for no in eps_sorted
+                   if not os.path.exists(os.path.join(out_dir, f"ep{no:02d}.mp4"))]
+        if missing:
+            raise RuntimeError(f"缺少分集文件 ep{missing}，请先补齐再合成")
         for i, no in enumerate(eps_sorted):
             p = os.path.join(out_dir, f"ep{no:02d}.mp4")
             off, tbn = self._v_info(p)
@@ -920,20 +998,30 @@ class DramaTool:
         with open(lst, "w", encoding="utf-8") as fh:
             for no in eps_sorted:
                 fh.write(f"file '{use[no].replace(os.sep, '/')}'\n")
-        cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        cmd = [FFMPEG, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
                "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", full_path]
-        r = subprocess.run(cmd, capture_output=True, text=True, env=ENV_NO_PROXY,
-                           timeout=3600)
-        for t in tmps:
-            try:
-                os.remove(t)
-            except OSError:
-                pass
+        try:
+            rc, tail_txt = ff_run(cmd, 3600)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("合成超时（3600s）")
+        # 中间文件（归一化副本 + concat 清单）放后台删：某些环境对删除
+        # 有安全拦截会挂起调用，不能让任务卡在 merging
+        def _cleanup(paths):
+            for p in paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+        _tmp_all = list(tmps)
         if os.path.exists(lst):
-            os.remove(lst)
-        if r.returncode != 0:
-            raise RuntimeError("合成失败: " + (r.stderr or "")[-300:])
+            _tmp_all.append(lst)
+        if _tmp_all:
+            threading.Thread(target=_cleanup, args=(_tmp_all,),
+                             daemon=True).start()
+        if rc != 0:
+            raise RuntimeError("合成失败: " + (tail_txt or "")[-300:])
         return os.path.getsize(full_path)
 
 
@@ -957,12 +1045,15 @@ class State:
 
     def snapshot(self):
         with self.lock:
-            return {"busy": self.busy, "status": self.status_msg,
+            return {"busy": self.busy or TMGR.active_count() > 0,
+                    "legacy_busy": self.busy,
+                    "status": self.status_msg,
                     "logs": self.logs[-400:], "result": self.result,
                     "current": ({"title": self.current["title"],
                                  "official_eps": self.current["official_eps"],
                                  "eps": len(self.current["eps"])}
-                                if self.current else None)}
+                                if self.current else None),
+                    "tasks": [t.info() for t in TMGR.tasks.values()]}
 
 
 STATE = State()
@@ -980,6 +1071,289 @@ def set_status(msg, busy=None):
     STATE.status_msg = msg
     if busy is not None:
         STATE.busy = busy
+
+
+# ---------------------------------------------------------------------------
+# 多任务队列：并行/排队下载、独立进度、失败隔离、去重与任务管理
+# ---------------------------------------------------------------------------
+class TaskCanceled(Exception):
+    pass
+
+
+class Task:
+    """一部剧的下载任务（独立状态与进度）。
+    mode: full=解析→下载→校验→合成；merge=仅合成既有分集目录"""
+    _seq = 0
+
+    def __init__(self, drama=None, out_dir=None, source="", mode="full",
+                 out_root=None, auto_merge=True):
+        Task._seq += 1
+        self.id = Task._seq
+        self.drama = drama
+        self.source = source or ""
+        self.mode = mode
+        self.out_dir = out_dir
+        self.out_root = out_root
+        self.auto_merge = auto_merge
+        self.title = (drama or {}).get("title") or (source[:40] or "未解析")
+        self.status = "queued"    # queued/resolving/downloading/verifying/
+        #                           merging/done/failed/canceled
+        self.done = 0
+        self.total = len((drama or {}).get("eps") or {})
+        self.fails, self.bad = [], []
+        self.error = ""
+        self.created = datetime.now()
+        self.canceled = False
+
+    def src_key(self):
+        """未解析时按链接规范化出的去重键（同一链接/任务/剧 slug 可识别）"""
+        s = self.source or ""
+        m = re.search(r"[?&]task_id=(\d+)", s)
+        if m:
+            return "task:" + m.group(1)
+        m = re.search(r"/detail/watch/([^/?#]+)", s)
+        if m:
+            return "watch:" + m.group(1)
+        m = re.search(r"[?&]playlet_id=(\d+)", s)
+        if m:
+            return "yc:" + m.group(1)
+        return ""
+
+    def keys(self):
+        """去重键集合：解析前用链接键，解析后同时给出平台键——
+        两两取交集即可判断同剧（含任务池链接与播放页链接指向同一剧）。"""
+        out = set()
+        sk = self.src_key()
+        if sk:
+            out.add(sk)
+        d = self.drama or {}
+        did = str(d.get("id") or d.get("playlet_id") or "")
+        if did:
+            out.add(f"{d.get('platform') or ''}:{did}")
+            out.add("watch:" + did)      # 与未解析的播放页链接对齐
+        return out
+
+    def info(self):
+        pct = round(100 * self.done / self.total) if self.total else 0
+        return {"id": self.id, "title": self.title,
+                "status": self.status, "done": self.done,
+                "total": self.total, "pct": pct,
+                "fails": self.fails, "bad": self.bad,
+                "error": self.error, "out": self.out_dir or "",
+                "mode": self.mode,
+                "created": self.created.strftime("%H:%M:%S")}
+
+
+def ts_conflict(a, b):
+    """两个任务是否指向同一部剧（仅对 full 模式去重；merge 不参与）。"""
+    if a is b or a.id == b.id or b.mode != "full":
+        return False
+    return bool(a.keys() & b.keys())
+
+
+class TaskManager:
+    """并行任务调度：信号量限并发；NetShort（本机 Edge）独占串行。"""
+    MAX_PARALLEL = 2
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.tasks = {}                    # id -> Task（按添加顺序）
+        self.sema = threading.Semaphore(self.MAX_PARALLEL)
+        self.ns_lock = threading.Lock()    # NetShort Edge 独占
+
+    # -- 管理 --------------------------------------------------------------
+    def add(self, task):
+        """返回 (ok, msg)。去重：同剧目已有任务（未移除）则拒绝。"""
+        with self.lock:
+            ks = task.keys()
+            if ks and task.mode == "full":
+                for t in self.tasks.values():
+                    if ts_conflict(t, task) and t.status not in ("canceled", "failed"):
+                        return False, (f"已在任务列表中（#{t.id}《{t.title}》"
+                                       f"{t.status}），无需重复添加")
+            self.tasks[task.id] = task
+        threading.Thread(target=self._run, args=(task,), daemon=True).start()
+        return True, f"任务 #{task.id} 已加入队列"
+
+    def get(self, tid):
+        return self.tasks.get(tid)
+
+    def cancel(self, tid):
+        t = self.tasks.get(tid)
+        if not t:
+            return False, "任务不存在"
+        if t.status in ("done", "failed", "canceled"):
+            return False, f"任务已是终态（{t.status}）"
+        t.canceled = True
+        if t.status == "queued":
+            t.status = "canceled"
+        return True, f"任务 #{tid} 已标记取消（当前阶段完成后停止）"
+
+    def remove(self, tid):
+        t = self.tasks.get(tid)
+        if not t:
+            return False, "任务不存在"
+        if t.status in ("resolving", "downloading", "verifying", "merging"):
+            return False, "任务执行中，请先取消再移除"
+        with self.lock:
+            self.tasks.pop(tid, None)
+        return True, f"任务 #{tid} 已移除"
+
+    def clear_finished(self):
+        with self.lock:
+            dead = [tid for tid, t in self.tasks.items()
+                    if t.status in ("done", "failed", "canceled")]
+            for tid in dead:
+                self.tasks.pop(tid, None)
+        return len(dead)
+
+    def active_count(self):
+        return sum(1 for t in self.tasks.values()
+                   if t.status in ("resolving", "downloading",
+                                   "verifying", "merging", "queued"))
+
+    # -- 执行 --------------------------------------------------------------
+    def _run(self, task):
+        with self.sema:
+            try:
+                self._pipeline(task)
+            except TaskCanceled:
+                task.status = "canceled"
+                TOOL.log(f"[任务#{task.id}] 已取消")
+            except Exception as e:
+                task.status = "failed"
+                task.error = str(e)
+                TOOL.log(f"[任务#{task.id}] 失败（失败隔离，不影响其他任务）: {e}")
+
+    def _chk(self, task):
+        if task.canceled:
+            raise TaskCanceled()
+
+    def _resolve(self, task):
+        """按 source 解析剧目（北斗任务链接 / 播放页链接 / playlet_id）"""
+        text = task.source
+        task_link = DramaTool.parse_task_link(text)
+        if task_link:
+            return TOOL.resolve_task(task_link[0], task_link[1])
+        pkey, pname = detect_platform(text)
+        if pkey == "netshort":
+            return netshort_resolve(text)
+        if pkey == "narto":
+            return narto_resolve(text)
+        if pkey and pkey != "yc":
+            raise RuntimeError(f"{pname} 暂不支持自动下载，请使用支持的播放页链接")
+        pid, kw = DramaTool.parse_input(text)
+        if pid:
+            return TOOL.fetch_playlet(pid)
+        raise RuntimeError("无法定位剧目：任务支持北斗任务链接、播放页链接"
+                           "（YourChannel / NetShort / Narto Drama）或 playlet_id；"
+                           "剧名请先搜索后点「用此剧」")
+
+    def _download(self, task):
+        drama, out = task.drama, task.out_dir
+        os.makedirs(out, exist_ok=True)
+
+        def prog(no, st, done, total):
+            # 用户在下载途中取消：立即中断（不再等整部剧跑完）
+            if task.canceled:
+                raise TaskCanceled()
+            # 解析阶段（直链未取到）不推进完成数，避免 20 集任务显示成 19 集
+            if not st.startswith("ERR 未取到播放地址"):
+                task.done = done
+            if not task.total:
+                task.total = total
+            STATE.status_msg = (f"[任务#{task.id}]《{task.title}》"
+                                f"下载中 {task.done}/{task.total}（ep{no:02d}）")
+            TOOL.log(f"[任务#{task.id}]  ep{no:02d} {st}  ({task.done}/{task.total})")
+
+        if drama.get("platform") == "netshort":
+            with self.ns_lock:
+                self._chk(task)
+                TOOL.log(f"[任务#{task.id}] 平台 NetShort：逐集解析签名直链"
+                         f"（本机 Edge，任务串行）")
+                return netshort_download(drama["eps"], out, prog)
+        if drama.get("platform") == "narto":
+            TOOL.log(f"[任务#{task.id}] 平台 Narto Drama：逐集实时解析直链")
+            return narto_download(drama["eps"], out, TOOL.log, prog,
+                                  should_stop=lambda: task.canceled)
+        return TOOL.download_eps(drama["eps"], out, prog)
+
+    def _pipeline(self, task):
+        # 1) 解析
+        if task.drama is None:
+            task.status = "resolving"
+            STATE.status_msg = f"[任务#{task.id}] 解析剧目…"
+            self._chk(task)
+            task.drama = self._resolve(task)
+            task.title = task.drama["title"]
+            task.total = len(task.drama["eps"])
+            TOOL.log(f"[任务#{task.id}] 解析完成：《{task.title}》 "
+                     f"{task.total} 集（{task.drama.get('platform_name', '')}）")
+            # 解析后二次查重：任务池链接与播放页链接可能指向同一部剧
+            if task.mode == "full":
+                with self.lock:
+                    dup = next((t for t in self.tasks.values()
+                                if ts_conflict(task, t)
+                                and t.status not in ("canceled", "failed")), None)
+                if dup:
+                    task.status = "canceled"
+                    task.error = (f"与任务#{dup.id}《{dup.title}》指向同一部剧，"
+                                  f"已自动去重跳过")
+                    TOOL.log(f"[任务#{task.id}] {task.error}")
+                    return
+        # 2) 输出目录
+        if not task.out_dir:
+            root = task.out_root or DEFAULT_OUT
+            slug = re.sub(r"[^a-z0-9]+", "-",
+                          task.drama["title"].lower()).strip("-")
+            task.out_dir = os.path.join(root, slug)
+        # 3) 下载 + 校验
+        if task.mode == "full":
+            task.status = "downloading"
+            self._chk(task)
+            TOOL.log(f"[任务#{task.id}] 开始下载《{task.title}》 -> {task.out_dir}")
+            task.fails = self._download(task)
+            task.status = "verifying"
+            self._chk(task)
+            if task.fails:
+                TOOL.log(f"[任务#{task.id}] [警告] 下载失败 "
+                         f"{len(task.fails)} 集: {task.fails}")
+            task.bad = TOOL.verify_eps(task.out_dir, task.drama["eps"])
+            if task.bad:
+                TOOL.log(f"[任务#{task.id}] [警告] 校验未通过: {task.bad}")
+            else:
+                TOOL.log(f"[任务#{task.id}] [校验] {task.total} 集全部通过")
+            official = task.drama["official_eps"]
+            got = task.total - len(set(task.fails) | set(task.bad))
+            TOOL.log(f"[任务#{task.id}] [完整性] 官方 {official} 集 / 成功 {got} 集")
+            STATE.result = {"type": "download", "title": task.title,
+                            "out": task.out_dir, "official": official,
+                            "got": got, "fails": task.fails, "bad": task.bad}
+            # 4) 合成
+            if task.auto_merge and not task.fails and not task.bad:
+                self._merge(task)
+        elif task.mode == "merge":
+            self._merge(task)
+        if task.status != "canceled":
+            task.status = "done"
+            STATE.status_msg = f"[任务#{task.id}]《{task.title}》完成"
+            TOOL.log(f"[任务#{task.id}] 《{task.title}》 完成 -> {task.out_dir}")
+
+    def _merge(self, task):
+        task.status = "merging"
+        self._chk(task)
+        full = os.path.join(task.out_dir, "FULL.mp4")
+        size = TOOL.merge(task.out_dir, task.drama["eps"], full)
+        _rc, err = ff_run([FFMPEG, "-nostdin", "-hide_banner", "-i", full], 120)
+        m = re.search(r"Duration: (\S+)", err)
+        dur = m.group(1) if m else "?"
+        TOOL.log(f"[任务#{task.id}] [合成] FULL.mp4 {size//1048576}MB 时长 {dur}")
+        STATE.result = {"type": "merged", "title": task.title,
+                        "out": task.out_dir, "full": full,
+                        "size_mb": size // 1048576, "duration": dur}
+
+
+TMGR = TaskManager()
 
 
 # ---------------------------------------------------------------------------
@@ -1144,6 +1518,7 @@ def job_fetch(pid):
 
 
 def job_download(payload):
+    """兼容旧流程：把「当前选中剧目」作为任务加入队列（自动校验+合成）"""
     drama = STATE.current
     if not drama:
         set_status("请先搜索选定剧目", busy=False)
@@ -1151,77 +1526,58 @@ def job_download(payload):
     out_root = payload.get("out") or os.path.join(os.path.expanduser("~"), "Desktop")
     slug = re.sub(r"[^a-z0-9]+", "-", drama["title"].lower()).strip("-")
     out = os.path.join(out_root, slug)
-    os.makedirs(out, exist_ok=True)
-    STATE.download_dir = out
-    set_status(f"下载中：《{drama['title']}》 {len(drama['eps'])} 集", busy=True)
-    TOOL.log(f"[下载] 《{drama['title']}》 -> {out}")
-
-    def prog(no, st, done, total):
-        STATE.status_msg = f"下载中 {done}/{total}（当前 ep{no:02d}）"
-        TOOL.log(f"  ep{no:02d} {st}  ({done}/{total})")
-
-    try:
-        if drama.get("platform") == "netshort":
-            TOOL.log(f"[平台] NetShort：逐集解析签名直链（本机 Edge 驱动）")
-            fails = netshort_download(drama["eps"], out, prog)
-        elif drama.get("platform") == "narto":
-            TOOL.log(f"[平台] Narto Drama：逐集实时解析直链（免浏览器）")
-            fails = narto_download(drama["eps"], out, TOOL.log, prog)
-        else:
-            fails = TOOL.download_eps(drama["eps"], out, prog)
-        if fails:
-            TOOL.log(f"[警告] 下载失败 {len(fails)} 集: {fails}")
-        bad = TOOL.verify_eps(out, drama["eps"])
-        if bad:
-            TOOL.log(f"[警告] 校验未通过（缺文件/时长异常）: {bad}")
-        else:
-            TOOL.log(f"[校验] {len(drama['eps'])} 集全部通过（体积、时长、可解码）")
-        official = drama["official_eps"]
-        got = len(drama["eps"]) - len(set(fails) | set(bad))
-        note = "数量一致，无漏集" if got == official else "数量不一致，请查看日志!"
-        TOOL.log(f"[完整性] 官方 {official} 集 / 成功 {got} 集 —— {note}")
-        if drama.get("platform") == "netshort":
-            TOOL.log("[字幕] NetShort 剧集字幕为画面烧录式，已随视频获取")
-        else:
-            TOOL.log("[字幕] YourChannel 剧集字幕为画面烧录式，已随视频获取；"
-                     "片源无独立字幕文件")
-        STATE.result = {"type": "download",
-                        "title": drama["title"], "out": out,
-                        "official": official, "got": got,
-                        "fails": fails, "bad": bad}
-        set_status(f"下载完成 {got}/{official} 集 -> {out}", busy=False)
-    except Exception as e:
-        TOOL.log(f"[错误] 下载失败: {e}")
-        set_status(f"下载失败: {e}", busy=False)
+    t = Task(drama=drama, out_dir=out, mode="full")
+    ok, msg = TMGR.add(t)
+    TOOL.log(f"[任务] {msg}")
+    if not ok:
+        set_status(msg, busy=False)
+    else:
+        STATE.download_dir = out
+        set_status(f"任务 #{t.id} 已排队：《{drama['title']}》"
+                   f"{len(drama['eps'])} 集（并行上限 {TMGR.MAX_PARALLEL}）",
+                   busy=False)
 
 
 def job_merge():
+    """兼容旧流程：把「当前剧目已下载目录」的合成作为任务加入队列"""
     drama = STATE.current
     out = STATE.download_dir
     if not drama or not out or not os.path.isdir(out):
         set_status("请先完成下载", busy=False)
         return
-    set_status("合成中（无损拼接，不重编码）…", busy=True)
-    full = os.path.join(out, "FULL.mp4")
-    try:
-        size = TOOL.merge(out, drama["eps"], full)
-        TOOL.log(f"[合成] 成片: {full} ({size//1048576}MB)")
-        r = subprocess.run([FFMPEG, "-hide_banner", "-i", full],
-                           capture_output=True, text=True, timeout=120)
-        m = re.search(r"Duration: (\S+)", r.stderr)
-        TOOL.log(f"[合成] 成片时长: {m.group(1) if m else '?'}")
-        STATE.result = {"type": "merged", "title": drama["title"],
-                        "out": out, "full": full,
-                        "size_mb": size // 1048576,
-                        "duration": m.group(1) if m else "?"}
-        set_status(f"合成完成: {full}", busy=False)
-        TOOL.log("[完成] 交付清单：")
-        TOOL.log(f"  分集目录: {out}")
-        TOOL.log(f"  合成成片: {full}")
-        TOOL.log(f"  运行日志: {_logfile}（界面可一键导出）")
-    except Exception as e:
-        TOOL.log(f"[错误] 合成失败: {e}")
-        set_status(f"合成失败: {e}", busy=False)
+    t = Task(drama=drama, out_dir=out, mode="merge")
+    ok, msg = TMGR.add(t)
+    TOOL.log(f"[任务] {msg}")
+    set_status(f"任务 #{t.id} 已排队：合成《{drama['title']}》" if ok else msg,
+               busy=False)
+
+
+def job_task_add(payload):
+    """新增任务：直接粘贴链接（北斗任务链接 / 播放页链接 / playlet_id），
+    解析→下载→校验→合成 全自动；支持多条（换行/分号分隔），去重排队"""
+    raw = payload.get("text") or ""
+    out_root = payload.get("out") or DEFAULT_OUT
+    lines = [x.strip() for x in re.split(r"[\n;；]+", raw) if x.strip()]
+    if not lines:
+        set_status("任务内容为空", busy=False)
+        return
+    added, skipped = [], []
+    for text in lines:
+        t = Task(source=text, out_root=out_root, mode="full")
+        ok, msg = TMGR.add(t)
+        if ok:
+            added.append(t)
+            TOOL.log(f"[任务] {msg}：{text[:60]}")
+        else:
+            skipped.append(msg)
+    if added:
+        set_status(f"已添加 {len(added)} 个任务（排队执行）", busy=False)
+    if skipped:
+        for m in skipped:
+            TOOL.log(f"[任务] 跳过：{m}")
+    STATE.result = {"type": "tasks_added",
+                    "added": [t.id for t in added], "skipped": skipped}
+    return {"added": [t.id for t in added], "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
@@ -1246,10 +1602,11 @@ th{background:#1b2130;color:#9fb6d9}
 .st{color:#8ea2bd;font-size:13px;margin:6px 0}
 .ok{color:#4fd07a} .warn{color:#ffb14f} .err{color:#ff6b6b}
 </style></head><body>
-<h1>🎬 Short Drama Downloader <small style="font-size:12px;color:#8ea2bd">YourChannel · NetShort · Narto Drama 短剧下载与合成</small></h1>
+<h1>🎬 Short Drama Downloader <small style="font-size:12px;color:#8ea2bd">v2.4.0 · YourChannel · NetShort · Narto Drama 短剧下载与合成</small></h1>
 <div class="row">
-  <input id="q" type="text" placeholder="剧名 / 播放页URL（YourChannel·NetShort·Narto Drama）/ playlet_id / 北斗任务链接">
+  <input id="q" type="text" placeholder="剧名 / 播放页URL（YourChannel·NetShort·Narto Drama）/ playlet_id / 北斗任务链接（多条链接用换行或分号分隔可批量添加任务）">
   <button onclick="doSearch()">搜索</button>
+  <button class="green" onclick="doTaskAdd()">添加为任务</button>
   <button class="gray" onclick="doClearResult()">清除结果</button>
 </div>
 <div class="row">
@@ -1268,6 +1625,9 @@ th{background:#1b2130;color:#9fb6d9}
 </div>
 <div id="bar"><div id="barin"></div></div>
 <div class="st" id="st">初始化…</div>
+<div class="row" style="margin:2px 0"><span style="color:#8ea2bd;font-size:12px">任务队列（并行上限 2，超出自动排队）</span>
+  <button class="gray" style="padding:4px 10px;font-size:12px" onclick="doClearFinished()">清除已完成任务</button></div>
+<table id="tasks" style="display:none"><thead><tr><th>#</th><th>剧名</th><th>状态</th><th>进度</th><th>输出目录</th><th>操作</th></tr></thead><tbody></tbody></table>
 <table id="cands" style="display:none"><thead><tr><th>匹配度</th><th>平台</th><th>剧名</th><th>集数</th><th>playlet_id</th><th></th></tr></thead><tbody></tbody></table>
 <div id="log"></div>
 <p style="color:#66708a;font-size:12px">支持平台：<b>YourChannel</b>（API 直连）、<b>NetShort</b>（播放页链接，签名直链由本机 Edge 解析）、<b>Narto Drama 多剧场</b>（播放页链接直连，含 BibiShort 等 35+ 片源，直链下载）；其余剧场（ShortMax / DramaBox / ReelShort / StardustTV / KalosTV / GoodShort / FlickReels / MoboReels / StoryReel）可识别并跨平台检索，下载适配持续推进。<br>
@@ -1277,6 +1637,10 @@ let timer=null;
 function fmt(){return (new Date).toLocaleTimeString('zh-CN',{hour12:false})}
 async function post(url,data){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data||{})});return r.json()}
 async function doSearch(){const t=document.getElementById('q').value;if(!t)return alert('请输入剧名、URL 或 id');await post('/api/search',{text:t})}
+async function doTaskAdd(){const t=document.getElementById('q').value;if(!t)return alert('请输入链接（多条用换行/分号分隔）');await post('/api/task_add',{text:t,out:document.getElementById('out').value})}
+async function doTaskCancel(el){const d=await post('/api/task_cancel',{id:Number(el.getAttribute('data-id'))});if(!d.ok)alert(d.msg)}
+async function doTaskRemove(el){const d=await post('/api/task_remove',{id:Number(el.getAttribute('data-id'))});if(!d.ok)alert(d.msg)}
+async function doClearFinished(){await post('/api/clear_finished',{})}
 async function doRefresh(){await post('/api/refresh',{})}
 async function doClearPool(){if(!confirm('确定清除本地任务池缓存？下次搜索将自动重新拉取。'))return;await post('/api/clear_pool',{})}
 async function doClearResult(){await post('/api/clear_result',{})}
@@ -1307,6 +1671,19 @@ async function poll(){
         tr.innerHTML=`<td>${c.ratio}</td><td>${c.app}</td><td>${c.title}</td><td>${c.episode_count||''}</td><td>${c.playlet_id||''}</td><td>${c.app==='yourchannel_drama'?'<button onclick=usePid(this) data-pid="'+c.playlet_id+'">用此剧</button>':(c.watch_url?'<button onclick=useNarto(this) data-url="'+c.watch_url+'">用此剧</button>':'<span style="color:#66708a">仅识别</span>')}</td>`;
         tb.appendChild(tr)}}
   } else {document.getElementById('cands').style.display='none';tb.dataset.n='0'}
+  const tk=document.querySelector('#tasks tbody');const tasks=s.tasks||[];
+  if(tasks.length){document.getElementById('tasks').style.display='';
+    const sig=tasks.map(t=>t.id+t.status+t.done+t.total+(t.error||'')).join('|');
+    if(tk.dataset.n!==sig){tk.innerHTML='';tk.dataset.n=sig;
+      for(const t of tasks){
+        const tr=document.createElement('tr');
+        const stColor={done:'#4fd07a',failed:'#ff6b6b',canceled:'#8ea2bd'}[t.status]||'#ffb14f';
+        const op=t.status==='done'||t.status==='failed'||t.status==='canceled'
+          ?`<button class="gray" onclick=doTaskRemove(this) data-id="${t.id}">移除</button>`
+          :`<button class="gray" onclick=doTaskCancel(this) data-id="${t.id}">取消</button>`;
+        tr.innerHTML=`<td>${t.id}</td><td>${t.title}</td><td style="color:${stColor}">${t.status}${t.error?'<br><span style="color:#ff6b6b">'+t.error+'</span>':''}</td><td><div style="display:inline-block;vertical-align:middle;width:110px;height:6px;background:#232838;border-radius:3px;overflow:hidden;margin-right:6px"><div style="height:100%;width:${t.pct}%;background:${stColor}"></div></div>${t.done}/${t.total} (${t.pct}%)</td><td>${t.out||'-'}</td><td>${op}</td>`;
+        tk.appendChild(tr)}}
+  } else {document.getElementById('tasks').style.display='none';tk.dataset.n=''}
   }catch(e){}
 }
 timer=setInterval(poll,1200);poll();
@@ -1353,12 +1730,28 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(self.rfile.read(n).decode("utf-8"))
             except Exception:
                 payload = {}
-        if STATE.busy and self.path not in ("/api/open_dir", "/api/pick_dir"):
+        # 旧流程互斥（搜索/获取/刷新/清除池）：同一时刻一个；任务提交不受限
+        LEGACY = {"/api/search", "/api/fetch", "/api/fetch_narto",
+                  "/api/refresh", "/api/clear_pool"}
+        if STATE.busy and self.path in LEGACY:
             self._json({"ok": False, "msg": "busy"})
             return
         if self.path == "/api/search":
             threading.Thread(target=job_search, args=(payload,), daemon=True).start()
             self._json({"ok": True})
+        elif self.path == "/api/task_add":
+            res = job_task_add(payload) or {}
+            self._json({"ok": True, "added": res.get("added", []),
+                        "skipped": res.get("skipped", [])})
+        elif self.path == "/api/task_cancel":
+            ok, msg = TMGR.cancel(payload.get("id"))
+            self._json({"ok": ok, "msg": msg})
+        elif self.path == "/api/task_remove":
+            ok, msg = TMGR.remove(payload.get("id"))
+            self._json({"ok": ok, "msg": msg})
+        elif self.path == "/api/clear_finished":
+            n_done = TMGR.clear_finished()
+            self._json({"ok": True, "removed": n_done})
         elif self.path == "/api/fetch":
             threading.Thread(target=job_fetch, args=(payload.get("id"),),
                              daemon=True).start()
