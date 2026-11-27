@@ -344,11 +344,16 @@ NARTO_REQ = threading.Semaphore(4)
 
 def narto_play_url(slug, no, sess=None, force_edge=False):
     """经边缘域 refresh-source 端点实时取分集直链（免登录，含重试）。
-    force_edge=True 时加 force=1&force_edge=1&no_cache=1，要求后端
-    返回站方边缘代理流（moviebox-edge/stream 边缘），用于直链 CDN
-    被 CloudFront 拦截（428）的场景——与站点播放器自身降级逻辑一致。"""
+    ① 全部请求带 no_cache=1：边缘缓存可能回放**已过期签名 URL**（GET 410
+    Gone），必须强制回源；② 站点有冷却机制（refresh_source_cooldown_active /
+    recently_failed，429 + retry_after_seconds），按站点给的秒数退避。
+    force_edge=True 时加 force=1&force_edge=1，要求后端返回站方边缘代理流
+    （moviebox-edge/stream 边缘），用于直链 CDN 被 CloudFront 拦截（428）
+    的场景——与站点播放器自身降级逻辑一致。"""
     sess = sess or narto_session()
-    extra = "&force=1&force_edge=1&no_cache=1" if force_edge else ""
+    extra = "&no_cache=1"
+    if force_edge:
+        extra += "&force=1&force_edge=1"
     u = (f"{NARTO_EDGE}/e/rs/detail/watch/{slug}/{no}/refresh-source"
          f"?lang={NARTO_LANG}{extra}")
     last_err = None
@@ -358,10 +363,13 @@ def narto_play_url(slug, no, sess=None, force_edge=False):
                 r = sess.get(u, headers={"Accept": "application/json"},
                              timeout=60)
             if r.status_code == 429:
-                # 站点冷却：refresh_source_recently_failed / cooldown_active，
-                # 立刻重试只会继续 429，必须退避后再来
+                # 站点冷却：按响应里的 retry_after_seconds 退避（有下限防 0）
+                try:
+                    wait_s = float(r.json().get("retry_after_seconds") or 0)
+                except Exception:
+                    wait_s = 0
                 last_err = RuntimeError("429 冷却: " + r.text[:80])
-                time.sleep(15 * (attempt + 1))
+                time.sleep(max(wait_s, 10.0) * (1 if attempt else 0.5))
                 continue
             d = r.json()
             if d.get("ok") and d.get("play_url"):
@@ -919,63 +927,112 @@ class DramaTool:
                 bad.append(no)
         return bad
 
-    def _v_info(self, f):
-        """读视频轨 (首帧pts秒, 时基tbn)。"""
-        pts, tbn = 0.0, None
-        try:
-            import re
-            _rc, err = ff_run(
-                [FFMPEG, "-nostdin", "-hide_banner", "-i", f, "-vf", "showinfo",
-                 "-an", "-frames:v", "1", "-f", "null", "-"], 60)
-            m = re.search(r"(\d+) tbn", err)
-            if m:
-                tbn = int(m.group(1))
-            for line in err.splitlines():
-                if "pts_time:" in line:
-                    pts = float(line.split("pts_time:")[1].split(" ")[0])
-                    break
-        except Exception:
-            pass
-        return pts, tbn
-
-    def _container_dur(self, f):
+    def _probe_params(self, f):
+        """探测分集编码参数（视频 codec/分辨率/fps/像素格式，音频 codec/
+        采样率/声道）。解析失败返回 None。"""
         try:
             _rc, err = ff_run([FFMPEG, "-nostdin", "-hide_banner", "-i", f], 60)
-            import re
-            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
-            if m:
-                return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
         except Exception:
-            pass
-        return None
+            return None
+        vline = aline = None
+        for ln in err.splitlines():
+            if ": Video: " in ln and vline is None:
+                vline = ln
+            elif ": Audio: " in ln and aline is None:
+                aline = ln
+        if not vline:
+            return None
+        p = {"vcodec": "", "profile": "", "w": 0, "h": 0, "fps": 0.0,
+             "pixfmt": "", "acodec": "", "arate": 0, "ach": 0}
+        m = re.search(r"Video: (\w+)", vline)
+        if m:
+            p["vcodec"] = m.group(1)
+        pm = re.search(r"Video: \w+ *\(([^)]*)\)", vline)
+        if pm:
+            p["profile"] = pm.group(1)
+        m = re.search(r"(\d{2,5})x(\d{2,5})", vline)
+        if m:
+            p["w"], p["h"] = int(m.group(1)), int(m.group(2))
+        m = re.search(r"([\d.]+) fps", vline)
+        if m:
+            p["fps"] = float(m.group(1))
+        m = re.search(r"(yuv420p10le|yuv420p|yuvj420p)", vline)
+        if m:
+            p["pixfmt"] = m.group(1)
+        if aline:
+            m = re.search(r"Audio: (\w+)", aline)
+            if m:
+                p["acodec"] = m.group(1)
+            m = re.search(r"(\d+) Hz", aline)
+            if m:
+                p["arate"] = int(m.group(1))
+            m = re.search(r"(\d+) channels", aline)
+            if m:
+                p["ach"] = int(m.group(1))
+            elif "stereo" in aline:
+                p["ach"] = 2
+            elif "mono" in aline:
+                p["ach"] = 1
+        return p
 
-    def _normalize_vstart(self, src, offset):
-        """流拷贝归一化视频轨：①首帧 pts 前移 offset 归零；②时基统一为
-        15360 tick/s——片源存在 30fps(15360) 与 24fps(12288) 混装，时基不
-        一致会让 concat -c copy 错算时间轴（24fps 内容被压进 1/30 刻度，
-        每集提速 25% 并产生大空洞），这是合成卡顿的核心根因；③截除片尾
-        音频静音填充。全程零转码。失败回退原文件。"""
-        dst = src[:-4] + "._ns.mp4"
-        dur = self._container_dur(src)
+    def _realign(self, src, dst, t):
+        """混装剧分集统一转码（H.264 CRF18 veryfast，视觉无损档）。
+        关键约束：MP4 单视频轨只写一份 SPS/PPS（extradata，取自第一集），
+        而 slice header 的位宽等编码随各自的 SPS——不同编码器/参数生成的
+        流即使分辨率帧率一致，也解不出正确画面（灰噪声/彩虹）。所以混装
+        剧必须全剧由同一编码器同参数统一转码，SPS 才天然一致；仅对齐
+        少数派是无效修复（实测已验证）。参数一致剧不走此路径（零转码）。"""
         cmd = [FFMPEG, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
-               "-itsoffset", str(-offset), "-i", src, "-i", src,
-               "-map", "0:v", "-map", "1:a", "-c", "copy",
-               "-video_track_timescale", "15360"]
-        if dur:
-            cmd += ["-t", str(round(dur - offset - 0.02, 3))]
-        cmd += ["-movflags", "+faststart", dst]
+               "-i", src]
+        if (t["w"], t["h"]) != (self._srcp["w"], self._srcp["h"]):
+            cmd += ["-vf", f"scale={t['w']}:{t['h']}"]
+        if t["fps"] > 0:
+            cmd += ["-r", f"{t['fps']:.3f}"]
+        cmd += ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+                "-pix_fmt", "yuv420p", "-video_track_timescale", "15360"]
+        if (t["acodec"] == self._srcp["acodec"]
+                and t["arate"] == self._srcp["arate"]
+                and t["ach"] == self._srcp["ach"] and self._srcp["acodec"]):
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", "128k"]
+            if t["arate"]:
+                cmd += ["-ar", str(t["arate"])]
+            if t["ach"]:
+                cmd += ["-ac", str(t["ach"])]
+        cmd += ["-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart", dst]
+        rc, err = ff_run(cmd, 3600)
+        if rc != 0 or not os.path.exists(dst) or os.path.getsize(dst) < 100_000:
+            raise RuntimeError("分集参数对齐失败 " + os.path.basename(src)
+                               + ": " + (err or "")[-200:])
+
+    def _trim_start(self, src, offset):
+        """流拷贝归一化：①输入侧 -ss 修剪到视频首帧关键帧（首帧 pts 归零，
+        片源 +0.1s 头部偏移会造成接缝冻结）；②时基统一 15360 tick/s。
+        单输入、零转码，替代旧的 -itsoffset 双输入方案（该方案会改动
+        时间戳基线，是播放器卡死/花屏的嫌疑源之一）。失败回退原文件。"""
+        dst = src[:-4] + "._ns.mp4"
+        cmd = [FFMPEG, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+               "-ss", f"{offset:.3f}", "-i", src, "-c", "copy",
+               "-video_track_timescale", "15360",
+               "-avoid_negative_ts", "make_zero",
+               "-movflags", "+faststart", dst]
         try:
             rc, _err = ff_run(cmd, 300)
-        except subprocess.TimeoutExpired:
+        except Exception:
             rc = -1
         if rc != 0 or not os.path.exists(dst):
             return src          # 修复失败时回退原文件（不影响合成）
         return dst
 
     def merge(self, out_dir, eps, full_path, progress_fn=None):
-        """无损合成。逐集归一化后 concat：①视频首帧 pts 归零（片源 +0.16s
-        头部偏移会造成接缝冻结）②视频时基统一 15360（30/24fps 混装时基不
-        一致会造成跳帧与大空洞）③截除片尾音频静音填充。"""
+        """无损合成。流程：探测各集参数 → 以多数派参数为目标，不一致分集
+        对齐转码 → 首帧/时基归一 → concat 流拷贝 → 时长校验。
+        根因背景：MP4 单视频轨只写一份 SPS/PPS（取自第一集），分集混装
+        分辨率/帧率/编码参数时，从切换集开始解码参数错配 → 彩虹噪声/
+        黑屏（ffmpeg 软解容忍、常见播放器硬解必坏），播放器反复重建
+        解码器导致卡顿甚至假死。"""
         use, tmps = {}, []
         eps_sorted = sorted(eps)
         # 缺集会静默合成出不完整成片（concat 跳过不存在文件仍返回 0），先拦住
@@ -983,30 +1040,87 @@ class DramaTool:
                    if not os.path.exists(os.path.join(out_dir, f"ep{no:02d}.mp4"))]
         if missing:
             raise RuntimeError(f"缺少分集文件 ep{missing}，请先补齐再合成")
-        for i, no in enumerate(eps_sorted):
+
+        # 1) 参数探测 + 多数派目标
+        params, durs = {}, {}
+        for no in eps_sorted:
             p = os.path.join(out_dir, f"ep{no:02d}.mp4")
-            off, tbn = self._v_info(p)
-            if off > 0.02 or (tbn and tbn != 15360):
-                use[no] = self._normalize_vstart(p, off)
-                if use[no] != p:
-                    tmps.append(use[no])
-            else:
-                use[no] = p
+            params[no] = self._probe_params(p)
+            durs[no] = self._container_dur(p) or 0.0
             if progress_fn:
-                progress_fn(i + 1, len(eps_sorted))
+                progress_fn(no, f"参数探测 ok", 0, len(eps_sorted))
+        valid = [params[no] for no in eps_sorted if params[no]]
+        if not valid:
+            raise RuntimeError("无法解析分集编码参数，合成中止")
+        key = lambda p: (p["vcodec"], p["w"], p["h"], round(p["fps"] or 0, 2),
+                         p["pixfmt"])
+        cnt = {}
+        for p in valid:
+            cnt[key(p)] = cnt.get(key(p), 0) + 1
+        tk = max(cnt, key=cnt.get)
+        target = next(p for p in valid if key(p) == tk)
+        n_off = len(eps_sorted) - cnt[tk]
+        if n_off:
+            TOOL.log(f"[merge] 分集参数混装（{len(cnt)} 种参数组合），"
+                     f"全剧统一转码 H.264 {target['w']}x{target['h']}"
+                     f"@{target['fps']:.0f} 以根治花屏/黑屏")
+            # 混装剧统一目标：多数派的分辨率/帧率 + H.264（同一编码器同
+            # 参数才能保证全剧 SPS 一致，见 _realign 注释）
+            target = dict(target, vcodec="h264", profile="")
+
+        # 2) 参数对齐：混装时全剧统一转码（SPS 必须同源一致）；参数一致
+        #    时零转码快路径
+        self._srcp = None
+        for no in eps_sorted:
+            p = params[no]
+            if not p:
+                continue            # 探测失败的集交由后续 verify 兜底
+            src = os.path.join(out_dir, f"ep{no:02d}.mp4")
+            if n_off:
+                self._srcp = p
+                dst = os.path.join(out_dir, f"ep{no:02d}._al.mp4")
+                self._realign(src, dst, target)
+                tmps.append(dst)
+                use[no] = dst
+                durs[no] = self._container_dur(dst) or durs[no]
+                if progress_fn:
+                    progress_fn(no, "参数已对齐", 0, len(eps_sorted))
+            else:
+                use[no] = src
+
+        # 3) 首帧偏移/时基归一（流拷贝）
+        nopro = [no for no in eps_sorted if no not in use]
+        if nopro:
+            raise RuntimeError(f"分集编码参数无法解析 ep{nopro}，合成中止")
+        for no in eps_sorted:
+            if no not in use:
+                continue
+            off, tbn = self._v_info(use[no])
+            if off > 0.02 or (tbn and tbn != 15360):
+                ns = self._trim_start(use[no], off)
+                if ns != use[no]:
+                    tmps.append(ns)
+                    use[no] = ns
+            if progress_fn:
+                progress_fn(no, "归一化 ok", 0, len(eps_sorted))
+
+        # 4) concat 流拷贝（清单内路径必须是绝对路径：ffmpeg 以清单文件
+        #    所在目录为基准解析相对路径）
         lst = os.path.join(out_dir, "concat.txt")
         with open(lst, "w", encoding="utf-8") as fh:
             for no in eps_sorted:
-                fh.write(f"file '{use[no].replace(os.sep, '/')}'\n")
+                fh.write(f"file '{os.path.abspath(use[no]).replace(os.sep, '/')}'\n")
         cmd = [FFMPEG, "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+               "-fflags", "+genpts",
                "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
-               "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", full_path]
+               "-bsf:a", "aac_adtstoasc", "-avoid_negative_ts", "make_zero",
+               "-movflags", "+faststart", full_path]
         try:
             rc, tail_txt = ff_run(cmd, 3600)
         except subprocess.TimeoutExpired:
             raise RuntimeError("合成超时（3600s）")
-        # 中间文件（归一化副本 + concat 清单）放后台删：某些环境对删除
-        # 有安全拦截会挂起调用，不能让任务卡在 merging
+        # 中间文件（对齐副本 + 归一化副本 + concat 清单）放后台删：某些环境
+        # 对删除有安全拦截会挂起调用，不能让任务卡在 merging
         def _cleanup(paths):
             for p in paths:
                 try:
@@ -1022,7 +1136,45 @@ class DramaTool:
                              daemon=True).start()
         if rc != 0:
             raise RuntimeError("合成失败: " + (tail_txt or "")[-300:])
+
+        # 5) 时长 sanity check：成片时长 ≈ 各集时长之和（偏差 >3% 或 >2s
+        #    视为时间轴异常，宁可报错也不产出会让播放器卡死的坏文件）
+        expect = sum(d for no, d in durs.items() if no in use and d)
+        got = self._container_dur(full_path)
+        if got and expect and abs(got - expect) > max(2.0, 0.03 * expect):
+            raise RuntimeError(f"成片时长校验失败：实际 {got:.1f}s vs "
+                               f"预期 {expect:.1f}s，时间轴异常，已拒绝产出")
         return os.path.getsize(full_path)
+
+    def _container_dur(self, f):
+        try:
+            _rc, err = ff_run([FFMPEG, "-nostdin", "-hide_banner", "-i", f], 60)
+            import re
+            m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
+            if m:
+                return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        except Exception:
+            pass
+        return None
+
+    def _v_info(self, f):
+        """读视频轨 (首帧pts秒, 时基tbn)。"""
+        pts, tbn = 0.0, None
+        try:
+            _rc, err = ff_run(
+                [FFMPEG, "-nostdin", "-hide_banner", "-i", f, "-vf", "showinfo",
+                 "-an", "-frames:v", "1", "-f", "null", "-"], 60)
+            m = re.search(r"(\d+) tbn", err)
+            if m:
+                tbn = int(m.group(1))
+            for line in err.splitlines():
+                if "pts_time:" in line:
+                    pts = float(line.split("pts_time:")[1].split(" ")[0])
+                    break
+        except Exception:
+            pass
+        return pts, tbn
+
 
 
 # ---------------------------------------------------------------------------
@@ -1602,7 +1754,7 @@ th{background:#1b2130;color:#9fb6d9}
 .st{color:#8ea2bd;font-size:13px;margin:6px 0}
 .ok{color:#4fd07a} .warn{color:#ffb14f} .err{color:#ff6b6b}
 </style></head><body>
-<h1>🎬 Short Drama Downloader <small style="font-size:12px;color:#8ea2bd">v2.4.0 · YourChannel · NetShort · Narto Drama 短剧下载与合成</small></h1>
+<h1>🎬 Short Drama Downloader <small style="font-size:12px;color:#8ea2bd">v2.5.0 · YourChannel · NetShort · Narto Drama 短剧下载与合成</small></h1>
 <div class="row">
   <input id="q" type="text" placeholder="剧名 / 播放页URL（YourChannel·NetShort·Narto Drama）/ playlet_id / 北斗任务链接（多条链接用换行或分号分隔可批量添加任务）">
   <button onclick="doSearch()">搜索</button>
